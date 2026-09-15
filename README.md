@@ -14,7 +14,7 @@ SGLang 的 Quark 量化模組只實作了三種 scheme：
 
     # Scheme didn't allocate the parameter (e.g. W4A16); skip.
 
-**解法**：把 Quark 的 **N-packed `[K, N/8]`** 佈局重新打包成 GPTQ 的 **K-packed `[K/8, N]`**，SGLang 便能以既有的 GPTQ 路徑服務它。**權重一個位元都沒有改。**
+**解法**：把 Quark 的 **N-packed `[K, N/8]`** 佈局重新打包成 GPTQ 的 **K-packed `[K/8, N]`**，SGLang 便能以既有的 GPTQ 路徑服務它。**權重未改動任何一個位元。**
 
 ---
 
@@ -35,21 +35,23 @@ SGLang 的 Quark 量化模組只實作了三種 scheme：
         --quantization gptq --dtype bfloat16 --kv-cache-dtype bf16 \
         --served-model-name qwen3.8-27b --port 8080
 
+來源目錄與目的目錄亦可改用環境變數 `QUARK_SRC` / `GPTQ_DST` 指定。
+
 ---
 
 ## 轉換的關鍵：Quark 的 nibble 重排
 
-這是整個工作的技術核心，也是我們卡最久的地方。
+這是整個工作的技術核心，也是我們耗時最久的地方。
 
-Quark 在 `pack_method="reorder"` 之下，每個 int32 內的 8 個 4-bit 值**不是順序排列**，而是按：
+Quark 在 `pack_method="reorder"` 之下，每個 int32 內的 8 個 4-bit 值**並非順序排列**，而是按：
 
     order_map = [0, 2, 4, 6, 1, 3, 5, 7]
 
-重排。**忽略這一步，整個模型會輸出亂碼**——不是數值偏差，是完全不可讀的文字。
+重排。**忽略這一步，整個模型將輸出亂碼**——不是數值偏差，是完全不可讀的文字。
 
-我們最初的版本就是漏了這一步，靠數值 sweep 猜 nibble 語義兜了好幾小時。最後一讀官方 `quark/torch/utils/pack.py` 的 `Pack_4_bits` 就中了。
+我們最初的版本正是遺漏了這一步，以數值掃描猜測 nibble 語義數小時之久。最終閱讀官方 `quark/torch/utils/pack.py` 的 `Pack_4_bits` 之後即得解。
 
-**教訓：凡涉及外部格式，先讀官方實作，不要靠試探。**
+**教訓：凡涉及外部格式，先讀官方實作，不可依靠試探。**
 
 轉換器實作了完整語義：
 
@@ -77,36 +79,47 @@ Quark 在 `pack_method="reorder"` 之下，每個 int32 內的 8 個 4-bit 值**
 
 ---
 
-## 我們量到的（W7800 48GB / gfx1100 / ROCm 7.2.4）
+## 我們量到的（GIGABYTE Radeon™ PRO W7800 AI TOP 48G／單卡／70 CU／gfx1100／ROCm 7.2.4）
 
-| 項 | 值 |
-|---|---|
-| 單流 decode | **74 tokens/s** |
-| Wikitext word_perplexity | **9.7297**（AMD 官方卡 8.8250） |
-| GSM8K 5-shot non-thinking | **83.32%–84.08%**（兩次全量，greedy） |
+| 項 | 值 | 條件 |
+|---|---|---|
+| decode（DSH 真實 agent 路徑） | **62.11 t/s** | 上下文約 20K，n=11 |
+| decode（短提示單流） | **85.05 t/s** | 同一台機器、同一配置 |
+| Wikitext word_perplexity | **9.7297** | 對 AMD 官方卡 8.8250（+10.25%） |
+| GSM8K 5-shot non-thinking | **83.70% / 84.12%** | flexible / strict，兩次全量平均，greedy |
 
 ⚠️ **兩點必須提醒：**
 
 1. **我們的 greedy 解碼不確定。** 同機同配置、同樣 150 題連跑兩次，輸出只有 71.3% 相同。故單次跑分 = 真分數 + 噪音（約 ±1 pt）。詳見 `docs/NONDETERMINISM-GREEDY-20260915.md`。
 2. **解碼制度未對齊。** 我們用 greedy，AMD 官方卡用 `temperature=0.7, top_p=0.80, top_k=20, presence_penalty=1.5`。
 
-**與 AMD 公布數字的差距（PPL +10.25%、GSM8K −7.4 pt）我們尚未定位機制。** 已排除：權重量化（逐位元相同）、LM head、量測儀器、資料集、prompt 截斷、我們自己的 K-split 優化。詳見 `docs/SCOREBOARD-20260915.md`。
+**與 AMD 公布數字的差距（PPL +10.25%、GSM8K −7.81 pt）我們尚未定位機制。** 已排除六項嫌疑：權重量化（逐位元相同）、LM head、量測儀器、資料集、prompt 截斷、我們自己的 K-split 優化。詳見 `docs/SCOREBOARD-20260915.md`。
 
 ---
 
-## 目錄
+## 倉庫內容
 
-    tools/convert_quark_int4_to_gptq_v3.py   轉換器本體
-    docs/SCOREBOARD-20260915.md              全部實測分數的單一記錄點
-    docs/NONDETERMINISM-GREEDY-20260915.md   非確定性的定量報告
-    docs/COMMUNITY-POST-20260915.md          對應的論壇帖文
+| 路徑 | 內容 |
+|---|---|
+| `tools/convert_quark_int4_to_gptq_v3.py` | 轉換器本體（本倉唯一可執行檔） |
+| `docs/SCOREBOARD-20260915.md` | 全部實測分數的單一記錄點 |
+| `docs/NONDETERMINISM-GREEDY-20260915.md` | greedy 非確定性的定量報告 |
+| `docs/COMMUNITY-POST-20260915.md` | 對應的論壇帖文（含完整致謝、失敗記錄與技術附錄） |
+
+---
+
+## 發佈政策
+
+- 本倉只放**原始碼**與**可獨立驗證的報告**。
+- **生成物不入版控**：由 Markdown 衍生的 PDF／TXT 等一律不提交，需要時自行以任一 Markdown 渲染器產生。
+- 每一項數字都附量測條件與樣本數；任何無法復現的數字不列入。
 
 ---
 
 ## 已知限制
 
 - **只處理單一 `model.safetensors`** 的模型目錄（本轉換器針對 AMD 原版模型的佈局）。
-- **不含 kernel 改動。** 本文所述「我們的做法」限於轉換；我們的 SGLang fork 另有 kernel 層改動，未在此發佈。
+- **不含 kernel 改動。** 本倉所述「我們的做法」限於轉換層；我們的 SGLang fork 另有 kernel 層改動（相對上游 18 commit／42 檔），尚未在此發佈。帖文第六節已如實交代。
 - 需要約 19 GB 磁碟空間做中轉。
 
 ---

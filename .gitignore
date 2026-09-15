@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 *.safetensors
+
+# 生成物不入版控（CODE-CRAFT §6 #20）：由 Markdown 衍生的閱讀版本
+docs/*.pdf
+docs/*.txt
