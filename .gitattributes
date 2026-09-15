@@ -1,0 +1,6 @@
+# 統一換行，避免 CRLF 破壞 Python shebang 與 Markdown 差異
+* text=auto eol=lf
+
+# 二進位
+*.pdf  binary
+*.safetensors binary
