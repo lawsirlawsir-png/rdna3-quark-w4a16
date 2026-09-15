@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 lawsirlawsir-png
 """Quark INT4-W4A16 -> GPTQ-format converter v3 (OFFICIAL semantics).
 
 Verified against AMD Quark source (quark/torch/utils/pack.py, Pack_4_bits):
