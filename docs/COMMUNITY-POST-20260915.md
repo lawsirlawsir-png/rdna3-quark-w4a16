@@ -150,11 +150,20 @@ Quark 在 `pack_method="reorder"` 之下，每個 int32 內的 8 個 4-bit 值**
 
 ---
 
-## 六、可取得性（誠實交代）
+## 六、可取得性
 
-- 本專案的倉庫**沒有 remote**，kernel 改動**未推送**。本文所述「我們的做法」，讀者無法直接取得。
-- 但**轉換器的邏輯已在第一節完整描述**（含 `order_map`、`ORDER`、signed int4 與 zero-point 對齊），可自行實作。
-- 所有數字均為本機實測。凡未經實測者，已明確標為「未驗證」。
+**轉換器已開源：**
+
+> **https://github.com/lawsirlawsir-png/rdna3-quark-w4a16**
+
+內容：轉換器本體、README（含完整的 nibble 重排語義）、以及本文所引用的分數總表與非確定性報告。Apache-2.0。
+
+    git clone git@github.com:lawsirlawsir-png/rdna3-quark-w4a16.git
+
+**誠實交代兩點：**
+
+1. **我們只發佈了轉換器層。** 我們的 SGLang fork 另有 kernel 層改動（相對上游 `gfx1100-support` 分支 18 個 commit、42 檔），**尚未發佈**。本文第五節所述的機器碼拆解，是我們在自己的 fork 上做的。
+2. 所有數字均為本機實測。凡未經實測者，已明確標為「未驗證」。
 
 ---
 
