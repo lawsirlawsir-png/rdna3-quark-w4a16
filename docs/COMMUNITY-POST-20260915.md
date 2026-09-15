@@ -399,7 +399,7 @@ AMD 在 HuggingFace 放出 `amd/Qwen3.8-27B-Quark-AWQ-INT4-W4A16`，但它在 RD
 ### 8.7 已發佈的技術層（供取用）
 
     轉換器 : tools/convert_quark_int4_to_gptq_v3.py（Quark W4A16 → GPTQ，無損）
-    補丁   : patches/0001..0019.patch（基底 StevenChenSE/sglang gfx1100-support @ 1442c18）
+    補丁   : patches/（0001–0019，共 19 個 patch；基底 StevenChenSE/sglang gfx1100-support @ 1442c18）
      shim   : shim/rdna_lmhead_int8.py（INT4 LM head，端到端 +19.7%）
      repo   : https://github.com/lawsirlawsir-png/rdna3-quark-w4a16  (tag v1.0.0)
 
