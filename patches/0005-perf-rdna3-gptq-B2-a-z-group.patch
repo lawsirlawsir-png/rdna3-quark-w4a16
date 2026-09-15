@@ -1,0 +1,370 @@
+From 9af1d8dfc629e3d081de2dfa7301ddddbe098480 Mon Sep 17 00:00:00 2001
+From: lawsir <lawsir@local>
+Date: Sun, 13 Sep 2026 00:12:00 +0800
+Subject: [PATCH 05/19] =?UTF-8?q?perf(rdna3-gptq):=20B2=20=E2=80=94=20?=
+ =?UTF-8?q?=E7=B7=A8=E8=AD=AF=E6=9C=9F=E6=A8=A1=E6=9D=BF=E5=8C=96=EF=BC=8C?=
+ =?UTF-8?q?=CE=A3a=20=E9=A0=90=E7=AE=97=20+=20z=20=E4=BF=AE=E6=AD=A3?=
+ =?UTF-8?q?=E6=94=B9=E7=82=BA=E6=AF=8F=20group=20=E4=B8=80=E6=AC=A1?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+原理：每 k-octet 每 thread 由 4D+28M 降至 4D+21M 條指令
+  - 原本每 (m,col) 做 y*partial + z*sum_a 兩次 fma；z*Σa 屬 group 級常數，
+    改為每 group 尾做一次
+  - sum_a（每 k-step 4M 條 fdot2）不再需要：Σa 於 staging 階段用
+    warp shuffle + shared atomicAdd 一次算好（每 thread 一次性 ~25 條）
+
+關鍵：B2 必須是**編譯期** template 參數。第一版用執行期 bool，
+熱迴圈內的分支破壞 unroll 排程，反而慢 27~84%；改 if constexpr 後：
+  K5120/N17408  M=4 0.11918 → 0.10810 (−9.3%)
+                M=5 0.13743 → 0.12549 (−8.7%)
+                M=8 0.19207 → 0.16473 (−14.2%)   (sd<=0.26%)
+端到端 5K ctx：68.38 → 72.84 t/s（累計對 bf16 基準 57.12 = +27.5%），
+accept 4.0 不變、輸出 MD5 與基準逐字節相同。
+
+回歸：vs fp64 去量化參考，M=1（不啟用 B2）與 M=4/5（啟用）誤差同為
+0.239926% ⇒ B2 未引入額外誤差（該 0.24% 係 +128 magic bias 的固有抵消誤差）。
+
+安全：B2 只在 groupsize∈[32,256] 且整除 BLOCK_KN_SIZE 時啟用，
+其餘（fp16、M_COUNT==1、其他 group）自動走原路徑。
+---
+ .../aot/csrc/gemm/gptq/q_gemm_rdna3.cu        | 89 ++++++++++++++++---
+ .../aot/csrc/gemm/gptq/q_gemm_rdna3.hip       | 89 ++++++++++++++++---
+ 2 files changed, 152 insertions(+), 26 deletions(-)
+
+diff --git a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu
+index fb9eb4f..3ce08a8 100644
+--- a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu
++++ b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu
+@@ -264,7 +264,7 @@ __forceinline__ __device__ void load4_scales(const T* scales_row, int n,
+ // Main kernel.
+ // ---------------------------------------------------------------------------
+ 
+-template <typename T, int M_COUNT>
++template <typename T, int M_COUNT, bool B2>
+ __global__ void gemm_q4_kernel_rdna3(
+     const T* __restrict__ a, const uint32_t* __restrict__ b_q_weight,
+     const uint32_t* __restrict__ b_qzeros, const T* __restrict__ b_scales,
+@@ -291,6 +291,11 @@ __global__ void gemm_q4_kernel_rdna3(
+   constexpr int LDS_PAD = 8;
+   __shared__ T block_a[M_COUNT][BLOCK_KN_SIZE + LDS_PAD];
+ 
++  // ---- B2T (2026-09-13): 編譯期版本，熱迴圈內無執行期分支 ----
++  constexpr bool B2T = B2;
++  const int b2_gs = size_k / groups;
++  __shared__ float as_smem[M_COUNT][BLOCK_KN_SIZE / 32];
++
+   // Stage A: each thread loads 1 K element per M row into LDS (with optional
+   // act-order permutation). THREADS_X == BLOCK_KN_SIZE so this is a 1:1 map.
+   // For M_COUNT > 1 with size_m not a multiple of M_COUNT, slots past size_m
+@@ -331,6 +336,25 @@ __global__ void gemm_q4_kernel_rdna3(
+     // the LDS load above — but here all THREADS_X (=256) threads always do,
+     // regardless of whether their `n` is in bounds.
+     __syncthreads();
++
++    if constexpr (B2T) {
++  #pragma unroll
++      for (int m = 0; m < M_COUNT; ++m) {
++  #pragma unroll
++        for (int g = 0; g < BLOCK_KN_SIZE / 32; ++g) as_smem[m][g] = 0.0f;
++      }
++      __syncthreads();
++      const int g_loc = t / b2_gs;
++      const int ng_loc = BLOCK_KN_SIZE / b2_gs;
++  #pragma unroll
++      for (int m = 0; m < M_COUNT; ++m) {
++        float v = (offset_k + t < end_k) ? (float)block_a[m][t] : 0.0f;
++  #pragma unroll
++        for (int off = 16; off > 0; off >>= 1) v += __shfl_down(v, off);
++        if ((t & 31) == 0 && g_loc < ng_loc) atomicAdd(&as_smem[m][g_loc], v);
++      }
++      __syncthreads();
++    }
+   } else if (b_q_perm) {
+     // bf16 M=1 fast path skips LDS, but its global read below is sequential
+     // and cannot apply act-order. When a permutation is present, stage the
+@@ -345,6 +369,7 @@ __global__ void gemm_q4_kernel_rdna3(
+   // Group bookkeeping. We require size_k % groups == 0 (groupsize divides K).
+   const int groupsize = size_k / groups;
+   int group = offset_k / groupsize;
++  const int g_base = group;
+   int nextgroup = (group + 1) * groupsize;
+ 
+   // qweight stride: weights are [K/8, N] uint32 with K packed at dim 0.
+@@ -405,6 +430,16 @@ __global__ void gemm_q4_kernel_rdna3(
+   int k = offset_k;
+   while (k < end_k) {
+     if (k == nextgroup) {
++      if constexpr (B2T) {
++  #pragma unroll
++        for (int m = 0; m < M_COUNT; ++m) {
++  #pragma unroll
++          for (int col = 0; col < 4; ++col) {
++            block_c[m][col] = __fmaf_rn(z_b_f[col], as_smem[m][group - g_base],
++                                        block_c[m][col]);
++          }
++        }
++      }
+       group++;
+       nextgroup += groupsize;
+       refresh_group(group);
+@@ -563,16 +598,18 @@ __global__ void gemm_q4_kernel_rdna3(
+ 
+         // sum_a[m] = Σ a[m][i] via 4× v_dot2 with bf162(1,1) — no fp32 widen.
+         float sum_a[M_COUNT];
++        if constexpr (!B2T) {
+   #pragma unroll
+-        for (int m = 0; m < M_COUNT; ++m) {
+-          float s = 0.0f;
++          for (int m = 0; m < M_COUNT; ++m) {
++            float s = 0.0f;
+   #pragma unroll
+-          for (int b = 0; b < 4; ++b) {
+-            s = __builtin_amdgcn_fdot2_f32_bf16(*((bf16x2_t*)(&a_pack[m].f[b])),
+-                                                *((const bf16x2_t*)&BF16_ONES),
+-                                                s, /*clamp=*/false);
++            for (int b = 0; b < 4; ++b) {
++              s = __builtin_amdgcn_fdot2_f32_bf16(*((bf16x2_t*)(&a_pack[m].f[b])),
++                                                  *((const bf16x2_t*)&BF16_ONES),
++                                                  s, /*clamp=*/false);
++            }
++            sum_a[m] = s;
+           }
+-          sum_a[m] = s;
+         }
+ 
+         // Per col: build magic-value pack, dot against all M activations.
+@@ -598,9 +635,13 @@ __global__ void gemm_q4_kernel_rdna3(
+             }
+             // block_c += y_b_f * partial + z_b_f * sum_a (same correction as
+             // M=1)
+-            block_c[m][col] =
+-                __fmaf_rn(y_b_f[col], partial,
+-                          __fmaf_rn(z_b_f[col], sum_a[m], block_c[m][col]));
++            if constexpr (B2T) {
++              block_c[m][col] = __fmaf_rn(y_b_f[col], partial, block_c[m][col]);
++            } else {
++              block_c[m][col] =
++                  __fmaf_rn(y_b_f[col], partial,
++                            __fmaf_rn(z_b_f[col], sum_a[m], block_c[m][col]));
++            }
+           }
+         }
+       }
+@@ -608,6 +649,17 @@ __global__ void gemm_q4_kernel_rdna3(
+     k += 32;  // 4 weight words * 8 nibbles = 32 K elements
+   }
+ 
++  if constexpr (B2T) {
++  #pragma unroll
++    for (int m = 0; m < M_COUNT; ++m) {
++  #pragma unroll
++      for (int col = 0; col < 4; ++col) {
++        block_c[m][col] = __fmaf_rn(z_b_f[col], as_smem[m][group - g_base],
++                                    block_c[m][col]);
++      }
++    }
++  }
++
+   // ---- Epilogue: three store modes, selected by launch shape ----
+   //
+   // partials != nullptr: deterministic split-K. Plain FP32 stores to
+@@ -677,7 +729,7 @@ __global__ void gemm_q4_kernel_rdna3(
+ 
+ #else  // non-RDNA3 device pass: empty __global__ for symbol parity.
+ 
+-template <typename T, int M_COUNT>
++template <typename T, int M_COUNT, bool B2>
+ __global__ void gemm_q4_kernel_rdna3(const T*, const uint32_t*, const uint32_t*,
+                                      const T*, T*, const int, const int,
+                                      const int, const int, const int,
+@@ -701,7 +753,18 @@ void launch_gemm_q4_for_mcount(const T* a, const uint32_t* b_q_weight,
+             (size_m + M_COUNT - 1) / M_COUNT,
+             (size_k + BLOCK_KN_SIZE - 1) / BLOCK_KN_SIZE);
+ 
+-  gemm_q4_kernel_rdna3<T, M_COUNT><<<grid, block, 0, stream>>>(
++  const int b2_gs = size_k / groups;
++  const bool b2_ok = (b2_gs >= 32) && (b2_gs <= BLOCK_KN_SIZE) &&
++                     ((BLOCK_KN_SIZE % b2_gs) == 0);
++  if constexpr (std::is_same<T, __hip_bfloat16>::value && (M_COUNT > 1)) {
++    if (b2_ok) {
++      gemm_q4_kernel_rdna3<T, M_COUNT, true><<<grid, block, 0, stream>>>(
++          a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
++          zero_offset, b_q_perm, partials);
++      return;
++    }
++  }
++  gemm_q4_kernel_rdna3<T, M_COUNT, false><<<grid, block, 0, stream>>>(
+       a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
+       zero_offset, b_q_perm, partials);
+ }
+diff --git a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.hip b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.hip
+index a1447ef..4d52efa 100644
+--- a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.hip
++++ b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.hip
+@@ -265,7 +265,7 @@ __forceinline__ __device__ void load4_scales(const T* scales_row, int n,
+ // Main kernel.
+ // ---------------------------------------------------------------------------
+ 
+-template <typename T, int M_COUNT>
++template <typename T, int M_COUNT, bool B2>
+ __global__ void gemm_q4_kernel_rdna3(
+     const T* __restrict__ a, const uint32_t* __restrict__ b_q_weight,
+     const uint32_t* __restrict__ b_qzeros, const T* __restrict__ b_scales,
+@@ -292,6 +292,11 @@ __global__ void gemm_q4_kernel_rdna3(
+   constexpr int LDS_PAD = 8;
+   __shared__ T block_a[M_COUNT][BLOCK_KN_SIZE + LDS_PAD];
+ 
++  // ---- B2T (2026-09-13): 編譯期版本，熱迴圈內無執行期分支 ----
++  constexpr bool B2T = B2;
++  const int b2_gs = size_k / groups;
++  __shared__ float as_smem[M_COUNT][BLOCK_KN_SIZE / 32];
++
+   // Stage A: each thread loads 1 K element per M row into LDS (with optional
+   // act-order permutation). THREADS_X == BLOCK_KN_SIZE so this is a 1:1 map.
+   // For M_COUNT > 1 with size_m not a multiple of M_COUNT, slots past size_m
+@@ -332,6 +337,25 @@ __global__ void gemm_q4_kernel_rdna3(
+     // the LDS load above — but here all THREADS_X (=256) threads always do,
+     // regardless of whether their `n` is in bounds.
+     __syncthreads();
++
++    if constexpr (B2T) {
++  #pragma unroll
++      for (int m = 0; m < M_COUNT; ++m) {
++  #pragma unroll
++        for (int g = 0; g < BLOCK_KN_SIZE / 32; ++g) as_smem[m][g] = 0.0f;
++      }
++      __syncthreads();
++      const int g_loc = t / b2_gs;
++      const int ng_loc = BLOCK_KN_SIZE / b2_gs;
++  #pragma unroll
++      for (int m = 0; m < M_COUNT; ++m) {
++        float v = (offset_k + t < end_k) ? (float)block_a[m][t] : 0.0f;
++  #pragma unroll
++        for (int off = 16; off > 0; off >>= 1) v += __shfl_down(v, off);
++        if ((t & 31) == 0 && g_loc < ng_loc) atomicAdd(&as_smem[m][g_loc], v);
++      }
++      __syncthreads();
++    }
+   } else if (b_q_perm) {
+     // bf16 M=1 fast path skips LDS, but its global read below is sequential
+     // and cannot apply act-order. When a permutation is present, stage the
+@@ -346,6 +370,7 @@ __global__ void gemm_q4_kernel_rdna3(
+   // Group bookkeeping. We require size_k % groups == 0 (groupsize divides K).
+   const int groupsize = size_k / groups;
+   int group = offset_k / groupsize;
++  const int g_base = group;
+   int nextgroup = (group + 1) * groupsize;
+ 
+   // qweight stride: weights are [K/8, N] uint32 with K packed at dim 0.
+@@ -406,6 +431,16 @@ __global__ void gemm_q4_kernel_rdna3(
+   int k = offset_k;
+   while (k < end_k) {
+     if (k == nextgroup) {
++      if constexpr (B2T) {
++  #pragma unroll
++        for (int m = 0; m < M_COUNT; ++m) {
++  #pragma unroll
++          for (int col = 0; col < 4; ++col) {
++            block_c[m][col] = __fmaf_rn(z_b_f[col], as_smem[m][group - g_base],
++                                        block_c[m][col]);
++          }
++        }
++      }
+       group++;
+       nextgroup += groupsize;
+       refresh_group(group);
+@@ -564,16 +599,18 @@ __global__ void gemm_q4_kernel_rdna3(
+ 
+         // sum_a[m] = Σ a[m][i] via 4× v_dot2 with bf162(1,1) — no fp32 widen.
+         float sum_a[M_COUNT];
++        if constexpr (!B2T) {
+   #pragma unroll
+-        for (int m = 0; m < M_COUNT; ++m) {
+-          float s = 0.0f;
++          for (int m = 0; m < M_COUNT; ++m) {
++            float s = 0.0f;
+   #pragma unroll
+-          for (int b = 0; b < 4; ++b) {
+-            s = __builtin_amdgcn_fdot2_f32_bf16(*((bf16x2_t*)(&a_pack[m].f[b])),
+-                                                *((const bf16x2_t*)&BF16_ONES),
+-                                                s, /*clamp=*/false);
++            for (int b = 0; b < 4; ++b) {
++              s = __builtin_amdgcn_fdot2_f32_bf16(*((bf16x2_t*)(&a_pack[m].f[b])),
++                                                  *((const bf16x2_t*)&BF16_ONES),
++                                                  s, /*clamp=*/false);
++            }
++            sum_a[m] = s;
+           }
+-          sum_a[m] = s;
+         }
+ 
+         // Per col: build magic-value pack, dot against all M activations.
+@@ -599,9 +636,13 @@ __global__ void gemm_q4_kernel_rdna3(
+             }
+             // block_c += y_b_f * partial + z_b_f * sum_a (same correction as
+             // M=1)
+-            block_c[m][col] =
+-                __fmaf_rn(y_b_f[col], partial,
+-                          __fmaf_rn(z_b_f[col], sum_a[m], block_c[m][col]));
++            if constexpr (B2T) {
++              block_c[m][col] = __fmaf_rn(y_b_f[col], partial, block_c[m][col]);
++            } else {
++              block_c[m][col] =
++                  __fmaf_rn(y_b_f[col], partial,
++                            __fmaf_rn(z_b_f[col], sum_a[m], block_c[m][col]));
++            }
+           }
+         }
+       }
+@@ -609,6 +650,17 @@ __global__ void gemm_q4_kernel_rdna3(
+     k += 32;  // 4 weight words * 8 nibbles = 32 K elements
+   }
+ 
++  if constexpr (B2T) {
++  #pragma unroll
++    for (int m = 0; m < M_COUNT; ++m) {
++  #pragma unroll
++      for (int col = 0; col < 4; ++col) {
++        block_c[m][col] = __fmaf_rn(z_b_f[col], as_smem[m][group - g_base],
++                                    block_c[m][col]);
++      }
++    }
++  }
++
+   // ---- Epilogue: three store modes, selected by launch shape ----
+   //
+   // partials != nullptr: deterministic split-K. Plain FP32 stores to
+@@ -678,7 +730,7 @@ __global__ void gemm_q4_kernel_rdna3(
+ 
+ #else  // non-RDNA3 device pass: empty __global__ for symbol parity.
+ 
+-template <typename T, int M_COUNT>
++template <typename T, int M_COUNT, bool B2>
+ __global__ void gemm_q4_kernel_rdna3(const T*, const uint32_t*, const uint32_t*,
+                                      const T*, T*, const int, const int,
+                                      const int, const int, const int,
+@@ -702,7 +754,18 @@ void launch_gemm_q4_for_mcount(const T* a, const uint32_t* b_q_weight,
+             (size_m + M_COUNT - 1) / M_COUNT,
+             (size_k + BLOCK_KN_SIZE - 1) / BLOCK_KN_SIZE);
+ 
+- hipLaunchKernelGGL(( gemm_q4_kernel_rdna3<T, M_COUNT>), dim3(grid), dim3(block), 0, stream, 
++  const int b2_gs = size_k / groups;
++  const bool b2_ok = (b2_gs >= 32) && (b2_gs <= BLOCK_KN_SIZE) &&
++                     ((BLOCK_KN_SIZE % b2_gs) == 0);
++  if constexpr (std::is_same<T, __hip_bfloat16>::value && (M_COUNT > 1)) {
++    if (b2_ok) {
++     hipLaunchKernelGGL(( gemm_q4_kernel_rdna3<T, M_COUNT, true>), dim3(grid), dim3(block), 0, stream, 
++          a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
++          zero_offset, b_q_perm, partials);
++      return;
++    }
++  }
++ hipLaunchKernelGGL(( gemm_q4_kernel_rdna3<T, M_COUNT, false>), dim3(grid), dim3(block), 0, stream, 
+       a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
+       zero_offset, b_q_perm, partials);
+ }
+-- 
+2.43.0
+

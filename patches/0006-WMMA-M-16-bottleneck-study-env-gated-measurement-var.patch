@@ -1,0 +1,1017 @@
+From 1f1ba80cfd657f54b2ee98b8f0b5be2358be8710 Mon Sep 17 00:00:00 2001
+From: lawsir <lawsir@mac-mini-hermes>
+Date: Sun, 13 Sep 2026 02:36:33 +0800
+Subject: [PATCH 06/19] WMMA M=16 bottleneck study: env-gated measurement
+ variants (SFL/NT32/ABL/NACC/PF) + k_split override; default path unchanged
+
+---
+ .../aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu   | 370 ++++++++++++++++--
+ .../aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.hip  | 370 ++++++++++++++++--
+ python/sglang/srt/layers/logits_processor.py  |   9 +
+ 3 files changed, 677 insertions(+), 72 deletions(-)
+
+diff --git a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu
+index ac15e79..0663887 100644
+--- a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu
++++ b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu
+@@ -370,7 +370,8 @@ __device__ __forceinline__ bf16_t tzero<bf16_t>() {
+ // output [m=2*i+hi][n=lane_lo] as the unique mapping that yields A @ B.
+ // ===========================================================================
+ 
+-template <typename T>
++template <typename T, bool SFL = false, int NT = 16, int ABL = 0, int NACC = 1,
++          int PF = 0>
+ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+     const T* __restrict__ a, const uint32_t* __restrict__ b_q,
+     const uint32_t* __restrict__ b_qzeros, const T* __restrict__ b_scales,
+@@ -381,16 +382,26 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+   using V16 = typename WmmaNative<T>::v16;
+ 
+   const int m_tile = blockIdx.y * 16;
+-  const int n_tile = blockIdx.x * 16;
++  const int n_tile = blockIdx.x * NT + ((NT == 16) ? 0 : (threadIdx.x >> 5)) * 16;
+   if (m_tile >= size_m || n_tile >= size_n) {
+     return;
+   }
+ 
+-  const int lane = threadIdx.x;   // 0..31
++  // DSH 2026-09-13: NT = N-tile width in columns (16 or 32). With NT=32
++  // the block is 2 waves; each wave owns an independent 16N slice and
++  // its own accumulator chain, while A is shared (same rows, same K).
++  const int lane = threadIdx.x & 31;  // 0..31
++  const int wave = (NT == 16) ? 0 : (threadIdx.x >> 5);
+   const int lane_lo = lane & 15;  // row index within fragment
+   const int lane_hi = lane >> 4;  // 0 or 1
+ 
+   v8fp32 c_acc = {0, 0, 0, 0, 0, 0, 0, 0};
++  // DSH 2026-09-13: extra accumulators to break the single WMMA dependency
++  // chain of one output tile. Alternate K-tiles between accumulators and fold
++  // at the end. Unused (and eliminated) when NACC == 1.
++  v8fp32 c_acc1 = {0, 0, 0, 0, 0, 0, 0, 0};
++  v8fp32 c_acc2 = {0, 0, 0, 0, 0, 0, 0, 0};
++  v8fp32 c_acc3 = {0, 0, 0, 0, 0, 0, 0, 0};
+ 
+   const int groupsize = size_k / groups;
+ 
+@@ -410,25 +421,74 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+   const int k_end = k_start + k_per_split;
+ 
+   // LDS tile of dequantized B. 16 K rows × 16 N cols.
+-  __shared__ T b_lds[16][16];
++  // DSH 2026-09-13: PF=1 software-pipelines the three B-path global loads one
++  // K-tile ahead, so their memory latency overlaps the current tile's dequant
++  // + LDS + WMMA instead of being exposed at the top of every iteration.
++  const int pf_actual_n = n_tile + lane_lo;
++  const int pf_qz_shift = (pf_actual_n & 7) * 4;
++  uint32_t pf_qa = 0, pf_zq = 0;
++  T pf_sc = tzero<T>();
++  if constexpr (PF) {
++    const int g0 = k_start / groupsize;
++    pf_qa = b_q[((k_start >> 3) + lane_hi) * size_n + pf_actual_n];
++    pf_zq =
++        ((b_qzeros[g0 * (size_n / 8) + pf_actual_n / 8] >> pf_qz_shift) & 0xF) +
++        (uint32_t)zero_offset;
++    pf_sc = b_scales[g0 * size_n + pf_actual_n];
++  }
++
++  __shared__ T b_lds[NT / 16][16][16];
++  T(&b_tile)[16][16] = b_lds[(NT == 16) ? 0 : wave];  // DSH: per-wave slice
++  V16 b_frag;  // DSH: hoisted for the SFL path
+ 
+   for (int k_tile = k_start; k_tile < k_end; k_tile += 16) {
++    uint32_t pf_nq = 0, pf_nz = 0;
++    T pf_ns = tzero<T>();
++    if constexpr (PF) {
++      const int kn = k_tile + 16;
++      if (kn < k_end) {
++        pf_nq = b_q[((kn >> 3) + lane_hi) * size_n + pf_actual_n];
++        const int gn = kn / groupsize;
++        pf_nz =
++            ((b_qzeros[gn * (size_n / 8) + pf_actual_n / 8] >> pf_qz_shift) &
++             0xF) +
++            (uint32_t)zero_offset;
++        pf_ns = b_scales[gn * size_n + pf_actual_n];
++      }
++    }
++
+     // ---- Dequant 16x16 B tile into LDS ----
+     // 32 lanes split 16 N cols × 2 K-octets per col = 32 dequant tasks.
+     const int my_n = lane_lo;
+     const int my_k_octet = lane_hi;  // 0 → K[0..7], 1 → K[8..15]
+     const int actual_n = n_tile + my_n;
+ 
+-    if (actual_n < size_n) {
++    if constexpr (ABL == 6) {
++  #pragma unroll
++      for (int i = 0; i < 16; ++i)
++        b_frag[i] = (E)((lane + i) & 15);
++    } else if (actual_n < size_n) {
+       const int qk_row = (k_tile / 8) + my_k_octet;
+-      const uint32_t qa = b_q[qk_row * size_n + actual_n];
+-
+-      const int g = k_tile / groupsize;
+-      const int qz_idx = g * (size_n / 8) + actual_n / 8;
+-      const int qz_shift = (actual_n & 7) * 4;
+-      const uint32_t zero_v =
+-          ((b_qzeros[qz_idx] >> qz_shift) & 0xF) + (uint32_t)zero_offset;
+-      const T scale_t = b_scales[g * size_n + actual_n];
++      (void)qk_row;
++      uint32_t qa = 0, zero_v = 0;
++      T scale_t = tzero<T>();
++      if constexpr (PF) {
++        qa = pf_qa;
++        zero_v = pf_zq;
++        scale_t = pf_sc;
++      } else {
++        if constexpr (ABL == 1) {
++          qa = (uint32_t)(lane * 2654435761u) ^ (uint32_t)k_tile;
++        } else {
++          qa = b_q[qk_row * size_n + actual_n];
++        }
++        const int g = k_tile / groupsize;
++        const int qz_idx = g * (size_n / 8) + actual_n / 8;
++        const int qz_shift = (actual_n & 7) * 4;
++        zero_v =
++            ((b_qzeros[qz_idx] >> qz_shift) & 0xF) + (uint32_t)zero_offset;
++        scale_t = b_scales[g * size_n + actual_n];
++      }
+ 
+       const int k_base = my_k_octet * 8;
+ 
+@@ -437,27 +497,65 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+         prep_zero_scale_fp16_precise(zero_v, scale_t, z_prep, y_prep);
+         half2 dq[4];
+         dequant_4bit_8_fp16_precise(qa, dq, z_prep, y_prep);
+-        b_lds[k_base + 0][my_n] = __low2half(dq[0]);
+-        b_lds[k_base + 1][my_n] = __high2half(dq[0]);
+-        b_lds[k_base + 2][my_n] = __low2half(dq[1]);
+-        b_lds[k_base + 3][my_n] = __high2half(dq[1]);
+-        b_lds[k_base + 4][my_n] = __low2half(dq[2]);
+-        b_lds[k_base + 5][my_n] = __high2half(dq[2]);
+-        b_lds[k_base + 6][my_n] = __low2half(dq[3]);
+-        b_lds[k_base + 7][my_n] = __high2half(dq[3]);
++        if constexpr (SFL) {
++          uint32_t bv[8];
++  #pragma unroll
++          for (int j = 0; j < 4; ++j) {
++            uint32_t u = 0u;
++            static_assert(sizeof(dq[j]) == 4, "dq packing must be 4 bytes");
++            __builtin_memcpy(&u, &dq[j], sizeof(dq[j]));
++            const uint32_t sx = __shfl_xor_sync(0xffffffffull, u, 16);
++            bv[j] = lane_hi ? sx : u;
++            bv[j + 4] = lane_hi ? u : sx;
++          }
++          static_assert(sizeof(b_frag) == 32, "V16 must be 32 bytes");
++          __builtin_memcpy(&b_frag, bv, sizeof(b_frag));
++        } else {
++        b_tile[k_base + 0][my_n] = __low2half(dq[0]);
++        b_tile[k_base + 1][my_n] = __high2half(dq[0]);
++        b_tile[k_base + 2][my_n] = __low2half(dq[1]);
++        b_tile[k_base + 3][my_n] = __high2half(dq[1]);
++        b_tile[k_base + 4][my_n] = __low2half(dq[2]);
++        b_tile[k_base + 5][my_n] = __high2half(dq[2]);
++        b_tile[k_base + 6][my_n] = __low2half(dq[3]);
++        b_tile[k_base + 7][my_n] = __high2half(dq[3]);
++        }
+       } else {
+         float z_f, y_f;
+         prep_zero_scale_bf16_f32(zero_v, scale_t, z_f, y_f);
+         bf162_t dq[4];
+-        dequant_4bit_8_bf16_to_bf16(qa, dq, z_f, y_f);
+-        b_lds[k_base + 0][my_n] = dq[0].x;
+-        b_lds[k_base + 1][my_n] = dq[0].y;
+-        b_lds[k_base + 2][my_n] = dq[1].x;
+-        b_lds[k_base + 3][my_n] = dq[1].y;
+-        b_lds[k_base + 4][my_n] = dq[2].x;
+-        b_lds[k_base + 5][my_n] = dq[2].y;
+-        b_lds[k_base + 6][my_n] = dq[3].x;
+-        b_lds[k_base + 7][my_n] = dq[3].y;
++        if constexpr (ABL == 2) {
++  #pragma unroll
++          for (int j = 0; j < 4; ++j) {
++            uint32_t u = qa + (uint32_t)j + (uint32_t)(z_f * 0.0f);
++            __builtin_memcpy(&dq[j], &u, 4);
++          }
++        } else {
++          dequant_4bit_8_bf16_to_bf16(qa, dq, z_f, y_f);
++        }
++        if constexpr (SFL) {
++          uint32_t bv[8];
++  #pragma unroll
++          for (int j = 0; j < 4; ++j) {
++            uint32_t u = 0u;
++            static_assert(sizeof(dq[j]) == 4, "dq packing must be 4 bytes");
++            __builtin_memcpy(&u, &dq[j], sizeof(dq[j]));
++            const uint32_t sx = __shfl_xor_sync(0xffffffffull, u, 16);
++            bv[j] = lane_hi ? sx : u;
++            bv[j + 4] = lane_hi ? u : sx;
++          }
++          static_assert(sizeof(b_frag) == 32, "V16 must be 32 bytes");
++          __builtin_memcpy(&b_frag, bv, sizeof(b_frag));
++        } else {
++        b_tile[k_base + 0][my_n] = dq[0].x;
++        b_tile[k_base + 1][my_n] = dq[0].y;
++        b_tile[k_base + 2][my_n] = dq[1].x;
++        b_tile[k_base + 3][my_n] = dq[1].y;
++        b_tile[k_base + 4][my_n] = dq[2].x;
++        b_tile[k_base + 5][my_n] = dq[2].y;
++        b_tile[k_base + 6][my_n] = dq[3].x;
++        b_tile[k_base + 7][my_n] = dq[3].y;
++        }
+       }
+     }
+ 
+@@ -471,7 +569,7 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+     // we don't already have for free in single-wave mode.
+ 
+     // ---- Build A and B fragments, run WMMA ----
+-    V16 a_frag, b_frag;
++    V16 a_frag;
+     const int m_row = m_tile + lane_lo;
+ 
+     if (m_row < size_m) {
+@@ -493,7 +591,12 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+         // `&a_frag[0]`; ext_vector_type element addresses aren't reliably
+         // valid C pointers across compiler versions.
+         static_assert(sizeof(a_frag) == 32, "V16 must be 32 bytes (16 × 2)");
+-        __builtin_memcpy(&a_frag, a_row + k_tile, sizeof(a_frag));
++        if constexpr (ABL == 4) {
++  #pragma unroll
++          for (int i = 0; i < 16; ++i) a_frag[i] = (E)((lane + i) & 15);
++        } else {
++          __builtin_memcpy(&a_frag, a_row + k_tile, sizeof(a_frag));
++        }
+       }
+     } else {
+   #pragma unroll
+@@ -504,10 +607,12 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+     // slot, N-axis in lane). This is the AMD WMMA convention for the right
+     // operand of a matrix multiply — K-axis aligns with A's K-axis (also
+     // in slot), enabling per-lane inner products.
++  if constexpr (!SFL && ABL != 6) {
+   #pragma unroll
+     for (int i = 0; i < 16; i++) {
+-      b_frag[i] = bitcast_elem<T, E>(b_lds[i][lane_lo]);
++      b_frag[i] = bitcast_elem<T, E>(b_tile[i][lane_lo]);
+     }
++  }
+ 
+   #ifdef VLLM_WMMA_LAYOUT_DEBUG
+     // Diagnostic: skip WMMA, force c_acc to encode (lane, slot) so the
+@@ -524,15 +629,48 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+       k_tile = size_k;  // exit loop on next check
+     }
+   #else
+-    c_acc = wmma_mma(a_frag, b_frag, c_acc);
++    if constexpr (ABL == 3) {
++  #pragma unroll
++      for (int i = 0; i < 8; ++i) {
++        const float av = (float)((i & 1) ? a_frag[2 * i] : a_frag[2 * i + 1]);
++        const float bv = (float)((i & 1) ? b_frag[2 * i] : b_frag[2 * i + 1]);
++        c_acc[i] = __fmaf_rn(av, bv, c_acc[i]);
++      }
++    } else if constexpr (NACC == 4) {
++      const int sel = (k_tile >> 4) & 3;
++      if (sel == 0) c_acc = wmma_mma(a_frag, b_frag, c_acc);
++      else if (sel == 1) c_acc1 = wmma_mma(a_frag, b_frag, c_acc1);
++      else if (sel == 2) c_acc2 = wmma_mma(a_frag, b_frag, c_acc2);
++      else c_acc3 = wmma_mma(a_frag, b_frag, c_acc3);
++    } else if constexpr (NACC == 2) {
++      if ((k_tile >> 4) & 1) c_acc1 = wmma_mma(a_frag, b_frag, c_acc1);
++      else c_acc = wmma_mma(a_frag, b_frag, c_acc);
++    } else {
++      c_acc = wmma_mma(a_frag, b_frag, c_acc);
++    }
+   #endif
+ 
++    if constexpr (PF) {
++      pf_qa = pf_nq;
++      pf_zq = pf_nz;
++      pf_sc = pf_ns;
++    }
++
+     // No __syncthreads() needed before the next iter overwrites b_lds:
+     // single-wave block, and the next iter's ds_write to b_lds is preceded
+     // by a `s_waitcnt lgkmcnt(0)` from the compiler that ensures the WMMA's
+     // ds_read of b_frag has completed before the new ds_write issues.
+   }
+ 
++  if constexpr (NACC >= 2) {
++  #pragma unroll
++    for (int i = 0; i < 8; ++i) c_acc[i] += c_acc1[i];
++  }
++  if constexpr (NACC == 4) {
++  #pragma unroll
++    for (int i = 0; i < 8; ++i) c_acc[i] += c_acc2[i] + c_acc3[i];
++  }
++
+   // ---- Store C ----
+   // Lane t holds column n=lane_lo of the output tile, 8 rows determined by
+   // slot i and lane_hi:
+@@ -612,7 +750,8 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+ }
+ 
+ #else  // non-RDNA3 device pass: empty kernel for symbol parity.
+-template <typename T>
++template <typename T, bool SFL = false, int NT = 16, int ABL = 0, int NACC = 1,
++          int PF = 0>
+ __global__ void gemm_q4_wmma_kernel_16x16_1w(const T*, const uint32_t*,
+                                              const uint32_t*, const T*, T*,
+                                              const int, const int, const int,
+@@ -641,6 +780,68 @@ void launch_gemm_q4_wmma_16x16_1w(const T* a, const uint32_t* b_q_weight,
+       zero_offset, b_q_perm, partials);
+ }
+ 
++// DSH 2026-09-13: SFL variant - B fragment built by shfl_xor(16) instead of a
++// b_lds round-trip. Measurement entry only (SGL_WMMA_VARIANT=1616).
++template <typename T>
++void launch_gemm_q4_wmma_16x16_1w_sfl(const T* a, const uint32_t* b_q_weight,
++                                      const uint32_t* b_qzeros,
++                                      const T* b_scales, const int* b_q_perm,
++                                      T* c, int size_m, int size_n, int size_k,
++                                      int groups, int zero_offset,
++                                      cudaStream_t stream,
++                                      float* partials = nullptr,
++                                      int k_split_forced = 0) {
++  const int k_split =
++      (k_split_forced ? k_split_forced : compute_wmma_k_split(size_k));
++  dim3 block(32);
++  dim3 grid((size_n + 15) / 16, (size_m + 15) / 16, k_split);
++  gemm_q4_wmma_kernel_16x16_1w<T, true><<<grid, block, 0, stream>>>(
++      a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
++      zero_offset, b_q_perm, partials);
++}
++
++// DSH 2026-09-13: 16M x 32N, 2 waves per block. Each wave owns a 16N slice with
++// its own accumulator chain (2 independent WMMA chains per block) and both
++// waves read the SAME A rows / K slice. Measurement entry (SGL_WMMA_VARIANT=1632).
++template <typename T>
++void launch_gemm_q4_wmma_16x32_2w(const T* a, const uint32_t* b_q_weight,
++                                  const uint32_t* b_qzeros, const T* b_scales,
++                                  const int* b_q_perm, T* c, int size_m,
++                                  int size_n, int size_k, int groups,
++                                  int zero_offset, cudaStream_t stream,
++                                  float* partials = nullptr,
++                                  int k_split_forced = 0) {
++  const int k_split =
++      (k_split_forced ? k_split_forced : compute_wmma_k_split(size_k));
++  dim3 block(64);
++  dim3 grid((size_n + 31) / 32, (size_m + 15) / 16, k_split);
++  gemm_q4_wmma_kernel_16x16_1w<T, false, 32><<<grid, block, 0, stream>>>(
++      a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
++      zero_offset, b_q_perm, partials);
++}
++
++// DSH 2026-09-13: ablation entries for bottleneck attribution.
++//   ABL=1 (SGL_WMMA_VARIANT=1617): b_q global load elided  -> isolates weight-load latency/BW
++//   ABL=2 (SGL_WMMA_VARIANT=1618): dequant ALU elided      -> isolates dequant cost
++// Both produce WRONG numbers on purpose; timing only.
++template <typename T, int ABL, int NACC = 1, int PF = 0>
++void launch_gemm_q4_wmma_16x16_abl(const T* a, const uint32_t* b_q_weight,
++                                   const uint32_t* b_qzeros, const T* b_scales,
++                                   const int* b_q_perm, T* c, int size_m,
++                                   int size_n, int size_k, int groups,
++                                   int zero_offset, cudaStream_t stream,
++                                   float* partials = nullptr,
++                                   int k_split_forced = 0) {
++  const int k_split =
++      (k_split_forced ? k_split_forced : compute_wmma_k_split(size_k));
++  dim3 block(32);
++  dim3 grid((size_n + 15) / 16, (size_m + 15) / 16, k_split);
++  gemm_q4_wmma_kernel_16x16_1w<T, false, 16, ABL, NACC, PF>
++      <<<grid, block, 0, stream>>>(a, b_q_weight, b_qzeros, b_scales, c, size_m,
++                                   size_n, size_k, groups, zero_offset,
++                                   b_q_perm, partials);
++}
++
+ #if defined(__HIP__RDNA3__) || !defined(__HIP_DEVICE_COMPILE__)
+ 
+ // ===========================================================================
+@@ -2171,6 +2372,96 @@ void launch_gemm_q4_wmma_64x64_4w(const T* a, const uint32_t* b_q_weight,
+                                   int zero_offset, cudaStream_t stream,
+                                   float* partials = nullptr,
+                                   int k_split_forced = 0) {
++  // --- DSH V1 variant override (measurement only) ---
++  static const int sgl_wmma_variant = []() {
++    const char* e = ::getenv("SGL_WMMA_VARIANT");
++    return e ? ::atoi(e) : 0;
++  }();
++  if (sgl_wmma_variant == 16) {
++    launch_gemm_q4_wmma_16x16_1w<T>(a, b_q_weight, b_qzeros, b_scales,
++                                    b_q_perm, c, size_m, size_n, size_k, groups,
++                                    zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 32) {
++    launch_gemm_q4_wmma_32x16_2w<T>(a, b_q_weight, b_qzeros, b_scales,
++                                    b_q_perm, c, size_m, size_n, size_k, groups,
++                                    zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 6416) {
++    launch_gemm_q4_wmma_64x16_4w<T>(a, b_q_weight, b_qzeros, b_scales,
++                                    b_q_perm, c, size_m, size_n, size_k, groups,
++                                    zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 6432) {
++    launch_gemm_q4_wmma_64x32_4w<T>(a, b_q_weight, b_qzeros, b_scales,
++                                    b_q_perm, c, size_m, size_n, size_k, groups,
++                                    zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1616) {
++    launch_gemm_q4_wmma_16x16_1w_sfl<T>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1632) {
++    launch_gemm_q4_wmma_16x32_2w<T>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1617) {
++    launch_gemm_q4_wmma_16x16_abl<T, 1>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1618) {
++    launch_gemm_q4_wmma_16x16_abl<T, 2>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1619) {
++    launch_gemm_q4_wmma_16x16_abl<T, 3>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1620) {
++    launch_gemm_q4_wmma_16x16_abl<T, 4>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1650) {
++    launch_gemm_q4_wmma_16x16_abl<T, 0, 1, 1>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1642) {
++    launch_gemm_q4_wmma_16x16_abl<T, 0, 2>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1644) {
++    launch_gemm_q4_wmma_16x16_abl<T, 0, 4>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1626) {
++    launch_gemm_q4_wmma_16x16_abl<T, 6>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  // --- end DSH V1 ---
+   // Fall back to v4 when N < 64 (would waste 1+ waves on out-of-range cols).
+   if (size_m < 64 || size_n < 64) {
+     launch_gemm_q4_wmma_64x32_4w<T>(a, b_q_weight, b_qzeros, b_scales, b_q_perm,
+@@ -2285,8 +2576,15 @@ void launch_gemm_q4_wmma_deterministic(
+   constexpr long kMaxScratchBytes = 256L << 20;
+   constexpr int TILE_M = 128;
+ 
++  // DSH 2026-09-13: SGL_WMMA_KSPLIT override for the grid-parallelism sweep.
++  static const int sgl_ksplit = []() {
++    const char* e = ::getenv("SGL_WMMA_KSPLIT");
++    return e ? ::atoi(e) : 0;
++  }();
+   const int k_split =
+-      wmma_natural_k_split(size_m, size_n, size_k, b_q_perm != nullptr);
++      (sgl_ksplit > 0)
++          ? sgl_ksplit
++          : wmma_natural_k_split(size_m, size_n, size_k, b_q_perm != nullptr);
+ 
+   if (k_split == 1) {
+     // No split-K: the direct-store epilogue already has exactly one writer
+diff --git a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.hip b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.hip
+index 5829b01..994fa8c 100644
+--- a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.hip
++++ b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.hip
+@@ -371,7 +371,8 @@ __device__ __forceinline__ bf16_t tzero<bf16_t>() {
+ // output [m=2*i+hi][n=lane_lo] as the unique mapping that yields A @ B.
+ // ===========================================================================
+ 
+-template <typename T>
++template <typename T, bool SFL = false, int NT = 16, int ABL = 0, int NACC = 1,
++          int PF = 0>
+ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+     const T* __restrict__ a, const uint32_t* __restrict__ b_q,
+     const uint32_t* __restrict__ b_qzeros, const T* __restrict__ b_scales,
+@@ -382,16 +383,26 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+   using V16 = typename WmmaNative<T>::v16;
+ 
+   const int m_tile = blockIdx.y * 16;
+-  const int n_tile = blockIdx.x * 16;
++  const int n_tile = blockIdx.x * NT + ((NT == 16) ? 0 : (threadIdx.x >> 5)) * 16;
+   if (m_tile >= size_m || n_tile >= size_n) {
+     return;
+   }
+ 
+-  const int lane = threadIdx.x;   // 0..31
++  // DSH 2026-09-13: NT = N-tile width in columns (16 or 32). With NT=32
++  // the block is 2 waves; each wave owns an independent 16N slice and
++  // its own accumulator chain, while A is shared (same rows, same K).
++  const int lane = threadIdx.x & 31;  // 0..31
++  const int wave = (NT == 16) ? 0 : (threadIdx.x >> 5);
+   const int lane_lo = lane & 15;  // row index within fragment
+   const int lane_hi = lane >> 4;  // 0 or 1
+ 
+   v8fp32 c_acc = {0, 0, 0, 0, 0, 0, 0, 0};
++  // DSH 2026-09-13: extra accumulators to break the single WMMA dependency
++  // chain of one output tile. Alternate K-tiles between accumulators and fold
++  // at the end. Unused (and eliminated) when NACC == 1.
++  v8fp32 c_acc1 = {0, 0, 0, 0, 0, 0, 0, 0};
++  v8fp32 c_acc2 = {0, 0, 0, 0, 0, 0, 0, 0};
++  v8fp32 c_acc3 = {0, 0, 0, 0, 0, 0, 0, 0};
+ 
+   const int groupsize = size_k / groups;
+ 
+@@ -411,25 +422,74 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+   const int k_end = k_start + k_per_split;
+ 
+   // LDS tile of dequantized B. 16 K rows × 16 N cols.
+-  __shared__ T b_lds[16][16];
++  // DSH 2026-09-13: PF=1 software-pipelines the three B-path global loads one
++  // K-tile ahead, so their memory latency overlaps the current tile's dequant
++  // + LDS + WMMA instead of being exposed at the top of every iteration.
++  const int pf_actual_n = n_tile + lane_lo;
++  const int pf_qz_shift = (pf_actual_n & 7) * 4;
++  uint32_t pf_qa = 0, pf_zq = 0;
++  T pf_sc = tzero<T>();
++  if constexpr (PF) {
++    const int g0 = k_start / groupsize;
++    pf_qa = b_q[((k_start >> 3) + lane_hi) * size_n + pf_actual_n];
++    pf_zq =
++        ((b_qzeros[g0 * (size_n / 8) + pf_actual_n / 8] >> pf_qz_shift) & 0xF) +
++        (uint32_t)zero_offset;
++    pf_sc = b_scales[g0 * size_n + pf_actual_n];
++  }
++
++  __shared__ T b_lds[NT / 16][16][16];
++  T(&b_tile)[16][16] = b_lds[(NT == 16) ? 0 : wave];  // DSH: per-wave slice
++  V16 b_frag;  // DSH: hoisted for the SFL path
+ 
+   for (int k_tile = k_start; k_tile < k_end; k_tile += 16) {
++    uint32_t pf_nq = 0, pf_nz = 0;
++    T pf_ns = tzero<T>();
++    if constexpr (PF) {
++      const int kn = k_tile + 16;
++      if (kn < k_end) {
++        pf_nq = b_q[((kn >> 3) + lane_hi) * size_n + pf_actual_n];
++        const int gn = kn / groupsize;
++        pf_nz =
++            ((b_qzeros[gn * (size_n / 8) + pf_actual_n / 8] >> pf_qz_shift) &
++             0xF) +
++            (uint32_t)zero_offset;
++        pf_ns = b_scales[gn * size_n + pf_actual_n];
++      }
++    }
++
+     // ---- Dequant 16x16 B tile into LDS ----
+     // 32 lanes split 16 N cols × 2 K-octets per col = 32 dequant tasks.
+     const int my_n = lane_lo;
+     const int my_k_octet = lane_hi;  // 0 → K[0..7], 1 → K[8..15]
+     const int actual_n = n_tile + my_n;
+ 
+-    if (actual_n < size_n) {
++    if constexpr (ABL == 6) {
++  #pragma unroll
++      for (int i = 0; i < 16; ++i)
++        b_frag[i] = (E)((lane + i) & 15);
++    } else if (actual_n < size_n) {
+       const int qk_row = (k_tile / 8) + my_k_octet;
+-      const uint32_t qa = b_q[qk_row * size_n + actual_n];
+-
+-      const int g = k_tile / groupsize;
+-      const int qz_idx = g * (size_n / 8) + actual_n / 8;
+-      const int qz_shift = (actual_n & 7) * 4;
+-      const uint32_t zero_v =
+-          ((b_qzeros[qz_idx] >> qz_shift) & 0xF) + (uint32_t)zero_offset;
+-      const T scale_t = b_scales[g * size_n + actual_n];
++      (void)qk_row;
++      uint32_t qa = 0, zero_v = 0;
++      T scale_t = tzero<T>();
++      if constexpr (PF) {
++        qa = pf_qa;
++        zero_v = pf_zq;
++        scale_t = pf_sc;
++      } else {
++        if constexpr (ABL == 1) {
++          qa = (uint32_t)(lane * 2654435761u) ^ (uint32_t)k_tile;
++        } else {
++          qa = b_q[qk_row * size_n + actual_n];
++        }
++        const int g = k_tile / groupsize;
++        const int qz_idx = g * (size_n / 8) + actual_n / 8;
++        const int qz_shift = (actual_n & 7) * 4;
++        zero_v =
++            ((b_qzeros[qz_idx] >> qz_shift) & 0xF) + (uint32_t)zero_offset;
++        scale_t = b_scales[g * size_n + actual_n];
++      }
+ 
+       const int k_base = my_k_octet * 8;
+ 
+@@ -438,27 +498,65 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+         prep_zero_scale_fp16_precise(zero_v, scale_t, z_prep, y_prep);
+         half2 dq[4];
+         dequant_4bit_8_fp16_precise(qa, dq, z_prep, y_prep);
+-        b_lds[k_base + 0][my_n] = __low2half(dq[0]);
+-        b_lds[k_base + 1][my_n] = __high2half(dq[0]);
+-        b_lds[k_base + 2][my_n] = __low2half(dq[1]);
+-        b_lds[k_base + 3][my_n] = __high2half(dq[1]);
+-        b_lds[k_base + 4][my_n] = __low2half(dq[2]);
+-        b_lds[k_base + 5][my_n] = __high2half(dq[2]);
+-        b_lds[k_base + 6][my_n] = __low2half(dq[3]);
+-        b_lds[k_base + 7][my_n] = __high2half(dq[3]);
++        if constexpr (SFL) {
++          uint32_t bv[8];
++  #pragma unroll
++          for (int j = 0; j < 4; ++j) {
++            uint32_t u = 0u;
++            static_assert(sizeof(dq[j]) == 4, "dq packing must be 4 bytes");
++            __builtin_memcpy(&u, &dq[j], sizeof(dq[j]));
++            const uint32_t sx = __shfl_xor_sync(0xffffffffull, u, 16);
++            bv[j] = lane_hi ? sx : u;
++            bv[j + 4] = lane_hi ? u : sx;
++          }
++          static_assert(sizeof(b_frag) == 32, "V16 must be 32 bytes");
++          __builtin_memcpy(&b_frag, bv, sizeof(b_frag));
++        } else {
++        b_tile[k_base + 0][my_n] = __low2half(dq[0]);
++        b_tile[k_base + 1][my_n] = __high2half(dq[0]);
++        b_tile[k_base + 2][my_n] = __low2half(dq[1]);
++        b_tile[k_base + 3][my_n] = __high2half(dq[1]);
++        b_tile[k_base + 4][my_n] = __low2half(dq[2]);
++        b_tile[k_base + 5][my_n] = __high2half(dq[2]);
++        b_tile[k_base + 6][my_n] = __low2half(dq[3]);
++        b_tile[k_base + 7][my_n] = __high2half(dq[3]);
++        }
+       } else {
+         float z_f, y_f;
+         prep_zero_scale_bf16_f32(zero_v, scale_t, z_f, y_f);
+         bf162_t dq[4];
+-        dequant_4bit_8_bf16_to_bf16(qa, dq, z_f, y_f);
+-        b_lds[k_base + 0][my_n] = dq[0].x;
+-        b_lds[k_base + 1][my_n] = dq[0].y;
+-        b_lds[k_base + 2][my_n] = dq[1].x;
+-        b_lds[k_base + 3][my_n] = dq[1].y;
+-        b_lds[k_base + 4][my_n] = dq[2].x;
+-        b_lds[k_base + 5][my_n] = dq[2].y;
+-        b_lds[k_base + 6][my_n] = dq[3].x;
+-        b_lds[k_base + 7][my_n] = dq[3].y;
++        if constexpr (ABL == 2) {
++  #pragma unroll
++          for (int j = 0; j < 4; ++j) {
++            uint32_t u = qa + (uint32_t)j + (uint32_t)(z_f * 0.0f);
++            __builtin_memcpy(&dq[j], &u, 4);
++          }
++        } else {
++          dequant_4bit_8_bf16_to_bf16(qa, dq, z_f, y_f);
++        }
++        if constexpr (SFL) {
++          uint32_t bv[8];
++  #pragma unroll
++          for (int j = 0; j < 4; ++j) {
++            uint32_t u = 0u;
++            static_assert(sizeof(dq[j]) == 4, "dq packing must be 4 bytes");
++            __builtin_memcpy(&u, &dq[j], sizeof(dq[j]));
++            const uint32_t sx = __shfl_xor_sync(0xffffffffull, u, 16);
++            bv[j] = lane_hi ? sx : u;
++            bv[j + 4] = lane_hi ? u : sx;
++          }
++          static_assert(sizeof(b_frag) == 32, "V16 must be 32 bytes");
++          __builtin_memcpy(&b_frag, bv, sizeof(b_frag));
++        } else {
++        b_tile[k_base + 0][my_n] = dq[0].x;
++        b_tile[k_base + 1][my_n] = dq[0].y;
++        b_tile[k_base + 2][my_n] = dq[1].x;
++        b_tile[k_base + 3][my_n] = dq[1].y;
++        b_tile[k_base + 4][my_n] = dq[2].x;
++        b_tile[k_base + 5][my_n] = dq[2].y;
++        b_tile[k_base + 6][my_n] = dq[3].x;
++        b_tile[k_base + 7][my_n] = dq[3].y;
++        }
+       }
+     }
+ 
+@@ -472,7 +570,7 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+     // we don't already have for free in single-wave mode.
+ 
+     // ---- Build A and B fragments, run WMMA ----
+-    V16 a_frag, b_frag;
++    V16 a_frag;
+     const int m_row = m_tile + lane_lo;
+ 
+     if (m_row < size_m) {
+@@ -494,7 +592,12 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+         // `&a_frag[0]`; ext_vector_type element addresses aren't reliably
+         // valid C pointers across compiler versions.
+         static_assert(sizeof(a_frag) == 32, "V16 must be 32 bytes (16 × 2)");
+-        __builtin_memcpy(&a_frag, a_row + k_tile, sizeof(a_frag));
++        if constexpr (ABL == 4) {
++  #pragma unroll
++          for (int i = 0; i < 16; ++i) a_frag[i] = (E)((lane + i) & 15);
++        } else {
++          __builtin_memcpy(&a_frag, a_row + k_tile, sizeof(a_frag));
++        }
+       }
+     } else {
+   #pragma unroll
+@@ -505,10 +608,12 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+     // slot, N-axis in lane). This is the AMD WMMA convention for the right
+     // operand of a matrix multiply — K-axis aligns with A's K-axis (also
+     // in slot), enabling per-lane inner products.
++  if constexpr (!SFL && ABL != 6) {
+   #pragma unroll
+     for (int i = 0; i < 16; i++) {
+-      b_frag[i] = bitcast_elem<T, E>(b_lds[i][lane_lo]);
++      b_frag[i] = bitcast_elem<T, E>(b_tile[i][lane_lo]);
+     }
++  }
+ 
+   #ifdef VLLM_WMMA_LAYOUT_DEBUG
+     // Diagnostic: skip WMMA, force c_acc to encode (lane, slot) so the
+@@ -525,15 +630,48 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+       k_tile = size_k;  // exit loop on next check
+     }
+   #else
+-    c_acc = wmma_mma(a_frag, b_frag, c_acc);
++    if constexpr (ABL == 3) {
++  #pragma unroll
++      for (int i = 0; i < 8; ++i) {
++        const float av = (float)((i & 1) ? a_frag[2 * i] : a_frag[2 * i + 1]);
++        const float bv = (float)((i & 1) ? b_frag[2 * i] : b_frag[2 * i + 1]);
++        c_acc[i] = __fmaf_rn(av, bv, c_acc[i]);
++      }
++    } else if constexpr (NACC == 4) {
++      const int sel = (k_tile >> 4) & 3;
++      if (sel == 0) c_acc = wmma_mma(a_frag, b_frag, c_acc);
++      else if (sel == 1) c_acc1 = wmma_mma(a_frag, b_frag, c_acc1);
++      else if (sel == 2) c_acc2 = wmma_mma(a_frag, b_frag, c_acc2);
++      else c_acc3 = wmma_mma(a_frag, b_frag, c_acc3);
++    } else if constexpr (NACC == 2) {
++      if ((k_tile >> 4) & 1) c_acc1 = wmma_mma(a_frag, b_frag, c_acc1);
++      else c_acc = wmma_mma(a_frag, b_frag, c_acc);
++    } else {
++      c_acc = wmma_mma(a_frag, b_frag, c_acc);
++    }
+   #endif
+ 
++    if constexpr (PF) {
++      pf_qa = pf_nq;
++      pf_zq = pf_nz;
++      pf_sc = pf_ns;
++    }
++
+     // No __syncthreads() needed before the next iter overwrites b_lds:
+     // single-wave block, and the next iter's ds_write to b_lds is preceded
+     // by a `s_waitcnt lgkmcnt(0)` from the compiler that ensures the WMMA's
+     // ds_read of b_frag has completed before the new ds_write issues.
+   }
+ 
++  if constexpr (NACC >= 2) {
++  #pragma unroll
++    for (int i = 0; i < 8; ++i) c_acc[i] += c_acc1[i];
++  }
++  if constexpr (NACC == 4) {
++  #pragma unroll
++    for (int i = 0; i < 8; ++i) c_acc[i] += c_acc2[i] + c_acc3[i];
++  }
++
+   // ---- Store C ----
+   // Lane t holds column n=lane_lo of the output tile, 8 rows determined by
+   // slot i and lane_hi:
+@@ -613,7 +751,8 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+ }
+ 
+ #else  // non-RDNA3 device pass: empty kernel for symbol parity.
+-template <typename T>
++template <typename T, bool SFL = false, int NT = 16, int ABL = 0, int NACC = 1,
++          int PF = 0>
+ __global__ void gemm_q4_wmma_kernel_16x16_1w(const T*, const uint32_t*,
+                                              const uint32_t*, const T*, T*,
+                                              const int, const int, const int,
+@@ -642,6 +781,68 @@ void launch_gemm_q4_wmma_16x16_1w(const T* a, const uint32_t* b_q_weight,
+       zero_offset, b_q_perm, partials);
+ }
+ 
++// DSH 2026-09-13: SFL variant - B fragment built by shfl_xor(16) instead of a
++// b_lds round-trip. Measurement entry only (SGL_WMMA_VARIANT=1616).
++template <typename T>
++void launch_gemm_q4_wmma_16x16_1w_sfl(const T* a, const uint32_t* b_q_weight,
++                                      const uint32_t* b_qzeros,
++                                      const T* b_scales, const int* b_q_perm,
++                                      T* c, int size_m, int size_n, int size_k,
++                                      int groups, int zero_offset,
++                                      hipStream_t stream,
++                                      float* partials = nullptr,
++                                      int k_split_forced = 0) {
++  const int k_split =
++      (k_split_forced ? k_split_forced : compute_wmma_k_split(size_k));
++  dim3 block(32);
++  dim3 grid((size_n + 15) / 16, (size_m + 15) / 16, k_split);
++ hipLaunchKernelGGL(( gemm_q4_wmma_kernel_16x16_1w<T, true>), dim3(grid), dim3(block), 0, stream, 
++      a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
++      zero_offset, b_q_perm, partials);
++}
++
++// DSH 2026-09-13: 16M x 32N, 2 waves per block. Each wave owns a 16N slice with
++// its own accumulator chain (2 independent WMMA chains per block) and both
++// waves read the SAME A rows / K slice. Measurement entry (SGL_WMMA_VARIANT=1632).
++template <typename T>
++void launch_gemm_q4_wmma_16x32_2w(const T* a, const uint32_t* b_q_weight,
++                                  const uint32_t* b_qzeros, const T* b_scales,
++                                  const int* b_q_perm, T* c, int size_m,
++                                  int size_n, int size_k, int groups,
++                                  int zero_offset, hipStream_t stream,
++                                  float* partials = nullptr,
++                                  int k_split_forced = 0) {
++  const int k_split =
++      (k_split_forced ? k_split_forced : compute_wmma_k_split(size_k));
++  dim3 block(64);
++  dim3 grid((size_n + 31) / 32, (size_m + 15) / 16, k_split);
++ hipLaunchKernelGGL(( gemm_q4_wmma_kernel_16x16_1w<T, false, 32>), dim3(grid), dim3(block), 0, stream, 
++      a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
++      zero_offset, b_q_perm, partials);
++}
++
++// DSH 2026-09-13: ablation entries for bottleneck attribution.
++//   ABL=1 (SGL_WMMA_VARIANT=1617): b_q global load elided  -> isolates weight-load latency/BW
++//   ABL=2 (SGL_WMMA_VARIANT=1618): dequant ALU elided      -> isolates dequant cost
++// Both produce WRONG numbers on purpose; timing only.
++template <typename T, int ABL, int NACC = 1, int PF = 0>
++void launch_gemm_q4_wmma_16x16_abl(const T* a, const uint32_t* b_q_weight,
++                                   const uint32_t* b_qzeros, const T* b_scales,
++                                   const int* b_q_perm, T* c, int size_m,
++                                   int size_n, int size_k, int groups,
++                                   int zero_offset, hipStream_t stream,
++                                   float* partials = nullptr,
++                                   int k_split_forced = 0) {
++  const int k_split =
++      (k_split_forced ? k_split_forced : compute_wmma_k_split(size_k));
++  dim3 block(32);
++  dim3 grid((size_n + 15) / 16, (size_m + 15) / 16, k_split);
++ hipLaunchKernelGGL(( gemm_q4_wmma_kernel_16x16_1w<T, false, 16, ABL, NACC, PF>)
++      , dim3(grid), dim3(block), 0, stream, a, b_q_weight, b_qzeros, b_scales, c, size_m,
++                                   size_n, size_k, groups, zero_offset,
++                                   b_q_perm, partials);
++}
++
+ #if defined(__HIP__RDNA3__) || !defined(__HIP_DEVICE_COMPILE__)
+ 
+ // ===========================================================================
+@@ -2172,6 +2373,96 @@ void launch_gemm_q4_wmma_64x64_4w(const T* a, const uint32_t* b_q_weight,
+                                   int zero_offset, hipStream_t stream,
+                                   float* partials = nullptr,
+                                   int k_split_forced = 0) {
++  // --- DSH V1 variant override (measurement only) ---
++  static const int sgl_wmma_variant = []() {
++    const char* e = ::getenv("SGL_WMMA_VARIANT");
++    return e ? ::atoi(e) : 0;
++  }();
++  if (sgl_wmma_variant == 16) {
++    launch_gemm_q4_wmma_16x16_1w<T>(a, b_q_weight, b_qzeros, b_scales,
++                                    b_q_perm, c, size_m, size_n, size_k, groups,
++                                    zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 32) {
++    launch_gemm_q4_wmma_32x16_2w<T>(a, b_q_weight, b_qzeros, b_scales,
++                                    b_q_perm, c, size_m, size_n, size_k, groups,
++                                    zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 6416) {
++    launch_gemm_q4_wmma_64x16_4w<T>(a, b_q_weight, b_qzeros, b_scales,
++                                    b_q_perm, c, size_m, size_n, size_k, groups,
++                                    zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 6432) {
++    launch_gemm_q4_wmma_64x32_4w<T>(a, b_q_weight, b_qzeros, b_scales,
++                                    b_q_perm, c, size_m, size_n, size_k, groups,
++                                    zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1616) {
++    launch_gemm_q4_wmma_16x16_1w_sfl<T>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1632) {
++    launch_gemm_q4_wmma_16x32_2w<T>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1617) {
++    launch_gemm_q4_wmma_16x16_abl<T, 1>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1618) {
++    launch_gemm_q4_wmma_16x16_abl<T, 2>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1619) {
++    launch_gemm_q4_wmma_16x16_abl<T, 3>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1620) {
++    launch_gemm_q4_wmma_16x16_abl<T, 4>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1650) {
++    launch_gemm_q4_wmma_16x16_abl<T, 0, 1, 1>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1642) {
++    launch_gemm_q4_wmma_16x16_abl<T, 0, 2>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1644) {
++    launch_gemm_q4_wmma_16x16_abl<T, 0, 4>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 1626) {
++    launch_gemm_q4_wmma_16x16_abl<T, 6>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  // --- end DSH V1 ---
+   // Fall back to v4 when N < 64 (would waste 1+ waves on out-of-range cols).
+   if (size_m < 64 || size_n < 64) {
+     launch_gemm_q4_wmma_64x32_4w<T>(a, b_q_weight, b_qzeros, b_scales, b_q_perm,
+@@ -2286,8 +2577,15 @@ void launch_gemm_q4_wmma_deterministic(
+   constexpr long kMaxScratchBytes = 256L << 20;
+   constexpr int TILE_M = 128;
+ 
++  // DSH 2026-09-13: SGL_WMMA_KSPLIT override for the grid-parallelism sweep.
++  static const int sgl_ksplit = []() {
++    const char* e = ::getenv("SGL_WMMA_KSPLIT");
++    return e ? ::atoi(e) : 0;
++  }();
+   const int k_split =
+-      wmma_natural_k_split(size_m, size_n, size_k, b_q_perm != nullptr);
++      (sgl_ksplit > 0)
++          ? sgl_ksplit
++          : wmma_natural_k_split(size_m, size_n, size_k, b_q_perm != nullptr);
+ 
+   if (k_split == 1) {
+     // No split-K: the direct-store epilogue already has exactly one writer
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index e64ac5f..a9e6519 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -900,6 +900,15 @@ class LogitsProcessor(nn.Module):
+     ) -> torch.Tensor:
+         # [RDNA3 W8A16 lm_head, 2026-09-12] 小 M（draft 的 M=1）走 int8 權重，
+         # 實測 2.2x。任何異常或未命中都靜默回退原路徑，零風險。
++        try:
++            import os as _os_mt
++
++            if _os_mt.environ.get("DSH_MODULE_TIMING") == "1":
++                from sglang.srt.speculative import dsh_module_timing as _dsdmt
++
++                _dsdmt.install()
++        except Exception:
++            pass
+         try:
+             from rdna_lmhead_int8 import try_lmhead as _rdna_try_lmhead
+ 
+-- 
+2.43.0
+

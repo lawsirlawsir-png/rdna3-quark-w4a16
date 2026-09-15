@@ -1,0 +1,43 @@
+From f0582ab3c4cb9ca563b7d6f74767ee61f0317fe8 Mon Sep 17 00:00:00 2001
+From: lawsir <lawsir@w7800>
+Date: Tue, 15 Sep 2026 15:23:50 +0800
+Subject: [PATCH 19/19] =?UTF-8?q?fix(probe):=20=E5=B0=87=20kernel=20witnes?=
+ =?UTF-8?q?s=20=E8=A8=BB=E5=86=8A=E9=96=98=E9=96=80=E9=A0=90=E8=A8=AD?=
+ =?UTF-8?q?=E9=97=9C=E9=96=89=EF=BC=88SGL=5FWITNESS=20opt-in=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+為什麼：register_witness() 令 _check_kernel_witness() 在每次 KV 寫入時對一個
+延遲配置的 tensor 做 tensor[0].item()（GPU→CPU 同步）。2026-09-14 的段錯誤
+調查把此路徑列為嫌疑；閘門關閉後崩潰點搬位而非消除，故判定它非肇事者，
+但仍是每步的效能成本。生產實際上一直以閘門關閉的狀態運行。
+
+改動：未設 SGL_WITNESS 即直接 return。行為與生產現狀一致；設 SGL_WITNESS=1
+可重新啟用（rollback 不需改碼）。
+
+影響：無行為改變（生產已等效運行此版本）；目的在於令 HEAD 與生產源碼一致。
+---
+ python/sglang/srt/utils/async_probe.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/python/sglang/srt/utils/async_probe.py b/python/sglang/srt/utils/async_probe.py
+index 607bb8c..8659c76 100644
+--- a/python/sglang/srt/utils/async_probe.py
++++ b/python/sglang/srt/utils/async_probe.py
+@@ -111,6 +111,12 @@ _WITNESS: dict = {}
+ 
+ 
+ def register_witness(tensor: torch.Tensor, kernel_names: dict):
++    # 2026-09-14: gated OFF by default. This registry makes _check_kernel_witness()
++    # dereference a lazily-allocated tensor on EVERY KV write via tensor[0].item(),
++    # which is implicated in the hsa_signal_load_relaxed segfaults (see
++    # docs/APPORT-SWAP-EXHAUSTION-20260914.md). Set SGL_WITNESS=1 to re-enable.
++    if not os.environ.get("SGL_WITNESS"):
++        return
+     _WITNESS[tensor.device.index or 0] = (tensor, kernel_names)
+ 
+ 
+-- 
+2.43.0
+

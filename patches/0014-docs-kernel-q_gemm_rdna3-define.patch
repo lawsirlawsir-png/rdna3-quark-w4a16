@@ -1,0 +1,66 @@
+From 7603807abcd69973d1cf7915f65d3cd0e9a707fe Mon Sep 17 00:00:00 2001
+From: lawsir <lawsir@mac-mini-hermes>
+Date: Mon, 14 Sep 2026 00:45:24 +0800
+Subject: [PATCH 14/19] =?UTF-8?q?docs(kernel):=20=E4=BF=AE=E6=AD=A3=20q=5F?=
+ =?UTF-8?q?gemm=5Frdna3=20=E8=A8=BB=E8=A7=A3=E8=88=87=20#define=20?=
+ =?UTF-8?q?=E8=87=AA=E7=9B=B8=E7=9F=9B=E7=9B=BE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+第二輪 review B2 指出、經核實：註解寫 Reverted to 256，而 #define 實際係 512，
+另描述一個已被推翻嘅 fp16 回歸實驗。任何人照註解判讀都會得出「生產 = 256」嘅錯結論。
+
+改為完整 HISTORY 區塊（256 baseline / 512 現行 / 1024 否決 / THREADS_X=128 否決），
+並明寫「#define 下一行才是單一真相」。純註解改動，0 行非註解變更，
+故不需重新編譯，生產 .so（7847e12eaf3d8b10）不受影響。
+---
+ .../aot/csrc/gemm/gptq/q_gemm_rdna3.cu        | 31 ++++++++++++-------
+ 1 file changed, 19 insertions(+), 12 deletions(-)
+
+diff --git a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu
+index 76350bc..4e6b208 100644
+--- a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu
++++ b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu
+@@ -63,19 +63,26 @@
+ namespace vllm {
+ namespace gptq_rdna3 {
+ 
+-// BLOCK_KN_SIZE = 256 (was 128 in exllama). Each block covers 256 K
+-// elements and THREADS_X*4 = 1024 N columns. For Qwen-class K=4096 this
+-// halves gridDim.z (32 → 16) and therefore halves the atomic count per
+-// output position vs the exllama default. THREADS_X=256 = 8 waves on RDNA3
+-// wave32; with ~32 wave slots per CU we still fit 4 blocks per CU at peak.
++// BLOCK_KN_SIZE = 512  (was 128 in exllama, then 256). Each block covers
++// 512 K elements and THREADS_X*4 = 1024 N columns.
+ //
+-// We tried BLOCK_KN_SIZE=512 (microbench on Qwen3.6-27B): bf16 improved
+-// 5-10% at large M (atomic CAS halved), but fp16 decode regressed up to
+-// +40% on qkv-square (32 → 45 μs at M=1). Cause: 16 waves/block × 16
+-// total blocks for [M=1, K=N=4096] only saturates ~8 of the 96 CUs,
+-// breaking memory-latency hiding for the fp16 path which is already
+-// memory-bound. Reverted to 256; bf16 keeps most of its gains from the
+-// fp32 dequant rewrite alone.
++// HISTORY - read before changing this value. The #define below is the single
++// source of truth; this comment used to contradict it (see NOTE at the end).
++//   256  = original RDNA3 port; kept as the rollback baseline.
++//          sha ff4d6acbc1e42aad, saved at /tmp/so_prod_rollback.so
++//   512  = CURRENT, chosen 2026-09-13. Paired microbench ratio vs 256
++//          = +3.7% (control 0.998); +7.1% on the log accept-3.0 bucket.
++//   1024 = REJECTED. User A/B on the fixed 3-turn sample: 61 t/s vs 70 t/s
++//          for 512. Split-K partial overhead = 16*M/BLOCK_KN_SIZE, so a
++//          larger block trades atomics for fewer partials; beyond 512 the
++//          extra K-loop iterations dominate at M=4.
++//   THREADS_X=128 variant measured -23%. Do not retry.
++//
++// NOTE: an earlier version of this comment claimed the value had been
++// reverted to 256 while the #define already read 512. It also described an
++// fp16 regression from a superseded experiment. Both were wrong. If you are
++// reading this to decide whether production runs 256 or 512: production runs
++// 512 (sha 7847e12eaf3d8b10), and the value is set on the next line.
+ #define BLOCK_KN_SIZE 512
+ #define THREADS_X 256
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,78 @@
+From 8ddf24bf1c4b5ec087e252264b4d7887d6466e51 Mon Sep 17 00:00:00 2001
+From: lawsir <lawsir@mac-mini-hermes>
+Date: Mon, 14 Sep 2026 09:15:42 +0800
+Subject: [PATCH 16/19] =?UTF-8?q?craft:=20=E8=90=BD=E5=AF=A6=20W1/W3=20?=
+ =?UTF-8?q?=E9=9B=B6=E9=A2=A8=E9=9A=AA=E4=BF=AE=E6=AD=A3=EF=BC=88=E8=A8=BB?=
+ =?UTF-8?q?=E8=A7=A3=20+=20=E4=B8=80=E5=80=8B=E9=80=9A=E9=81=8E=E7=9A=84?=
+ =?UTF-8?q?=20static=5Fassert=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+W1：修 q_gemm_rdna3.cu/.hip 的 stale 註解「THREADS_X == BLOCK_KN_SIZE 1:1 map」
+（現行 512/256 實為 2:1，KPT=2）；as_smem 補解釋（BLOCK_KN_SIZE/32 係 wave-width
+worst case，大 b2_gs 只寫前 ng_loc 欄，屬刻意設計非過度分配）；加 static_assert(KPT<=8)。
+
+W3：setup_rocm.py 修「Exclude from this test build only」失實註解 —— 此檔就是生產
+build 腳本，剔除生效於生產；並補 ROCm 升級後的復原指引。
+
+註解不影響 codegen，通過的 static_assert 亦不產生代碼，故重編譯預期得到逐位元相同
+二進位。**本輪未重編譯**，生產 .so（7847e12eaf3d8b10）不變。
+---
+ .../sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu | 11 ++++++++++-
+ python/sglang/kernels/aot/setup_rocm.py               |  7 ++++++-
+ 2 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu
+index 4e6b208..16d1eba 100644
+--- a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu
++++ b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu
+@@ -301,10 +301,17 @@ __global__ void gemm_q4_kernel_rdna3(
+   // ---- B2T (2026-09-13): 編譯期版本，熱迴圈內無執行期分支 ----
+   constexpr bool B2T = B2;
+   const int b2_gs = size_k / groups;
++  // as_smem: per-group activation sum for the B2T bias correction.
++  // Column count BLOCK_KN_SIZE/32 is the WAVE-WIDTH WORST CASE (b2_gs=32 ->
++  // ng_loc=16). For larger b2_gs (e.g. 128 -> ng_loc=4) only the first ng_loc
++  // columns are written; the rest are zeroed-but-unused. Sizing to the max
++  // keeps ONE template valid for every b2_gs admitted by the b2_ok guard
++  // (BLOCK_KN_SIZE % b2_gs == 0). Deliberate, not an over-allocation bug.
+   __shared__ float as_smem[M_COUNT][BLOCK_KN_SIZE / 32];
+ 
+   // Stage A: each thread loads 1 K element per M row into LDS (with optional
+-  // act-order permutation). THREADS_X == BLOCK_KN_SIZE so this is a 1:1 map.
++  // act-order permutation). KPT = BLOCK_KN_SIZE / THREADS_X: a 1:1 thread:K
++  // map when the two are equal, and 2:1 at the current 512/256 config (KPT=2).
+   // For M_COUNT > 1 with size_m not a multiple of M_COUNT, slots past size_m
+   // are zero-padded so the dot product contribution is 0 (we then skip the
+   // atomic write for those rows below).
+@@ -316,6 +323,8 @@ __global__ void gemm_q4_kernel_rdna3(
+   static_assert(BLOCK_KN_SIZE % THREADS_X == 0,
+                 "BLOCK_KN_SIZE must be a multiple of THREADS_X");
+   constexpr int KPT = BLOCK_KN_SIZE / THREADS_X;  // K elements per thread
++  static_assert(KPT <= 8,
++                "KPT too large: A-load LDS staging / VGPR budget exceeded");
+   // The M=1 fast path (skip LDS) only has a global-read code path for bf16
+   // (the v_dot2_f32_bf16 branch).  The fp16 inner loop still indexes
+   // block_a[m][a_off] unconditionally, so for fp16 we MUST stage A through
+diff --git a/python/sglang/kernels/aot/setup_rocm.py b/python/sglang/kernels/aot/setup_rocm.py
+index 4c75e18..21e4fce 100644
+--- a/python/sglang/kernels/aot/setup_rocm.py
++++ b/python/sglang/kernels/aot/setup_rocm.py
+@@ -108,7 +108,12 @@ if is_rdna:
+ 
+ # A/B bench patch (2026-09-08, ROCm 7.2.4): moe_q_gemm_rdna3 does not
+ # compile under ROCm 7.2.x clang (fork targets newer ROCm); MoE-only kernel,
+-# not needed for dense serving. Exclude from this test build only.
++# not needed for dense serving.
++# NOTE (2026-09-14 craft review): this is the PRODUCTION build script, NOT a
++# "test build", so the exclusion below is live in production.
++# RECOVERY after a ROCm upgrade: once the upgraded ROCm compiles
++# moe_q_gemm_rdna3.cu cleanly, delete the `if is_rdna:` block below to restore
++# the MoE kernel. The substring match currently hits only that one .cu.
+ if is_rdna:
+     sources = [s for s in sources if "moe_q_gemm_rdna3" not in s]
+ 
+-- 
+2.43.0
+

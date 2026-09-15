@@ -1,0 +1,147 @@
+From fb5276ece7d0aeb4bf993956660b9705009048e3 Mon Sep 17 00:00:00 2001
+From: lawsir <lawsir@local>
+Date: Sun, 13 Sep 2026 11:35:50 +0800
+Subject: [PATCH 12/19] =?UTF-8?q?fix(rdna3-wmma):=20=E9=87=8F=E6=B8=AC?=
+ =?UTF-8?q?=E8=AE=8A=E9=AB=94=20launcher=20=E7=B4=8D=E5=85=A5=20SGL=5FWMMA?=
+ =?UTF-8?q?=5FMEASUREMENT=5FBENCH=EF=BC=9B=E6=9B=B4=E6=AD=A3=E4=B8=89?=
+ =?UTF-8?q?=E8=99=95=E8=AA=87=E5=A4=A7=E5=AE=A3=E7=A8=B1?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+為什麼：第二輪全代碼切片審查發現，23dd307 只守衛了檔尾的 SGL_WMMA_VARIANT 分派表
+（2416-2509），而 824-884 的三個量測專用 launcher（SFL=1616 / 16x32_2w=1632 /
+ABL=1617,1618）與其模板具現化仍留在生產 .so 內。其中 ABL 分支的註解自陳
+"produce WRONG numbers on purpose; timing only"。
+
+證據：
+- 全檔唯一的 SGL_WMMA_MEASUREMENT_BENCH 守衛原本只在 2416-2509
+- 三個 launcher 的所有呼叫點都在該守衛區塊內（2449-2503），故一併守衛不斷編譯
+- 重建後 nm -C 對新 .so 的量測 launcher 符號數 = 0；生產用的
+  launch_gemm_q4_wmma_16x16_1w 仍有 2 個符號
+- 回歸：單流輸出 sha256[:16] = 6a7c88ed6ae7d5eb 與基線逐位元相同；
+  fp64 閘門 10/10 OK（修正判準後）；4 併發 109.3 t/s（基線中位數 110.2，雜訊內）
+
+另更正三處自身宣稱：
+1. 第 62 行「生產建置不含任何量測變體程式碼」-> 準確描述為分派表、launcher 與
+   模板具現化皆不含
+2. 第 272 行「6/6 命中最優」-> 實為 5/6。17408x5120 一列的真實量測最小是
+   k=32（0.22263），而規則選 k=16（0.22434），差 0.77%。權重合計 -7.9% 與
+   SGL_WMMA_KSPLIT_AUTO=1 的生產決策不受影響。
+3. eagle_worker_v2.py 加檔頭標記：該檔含 hybrid_patches.py 執行期注入的
+   _dsh_neural_ndt（非上游 SGLang 程式碼，DSH_HYBRID=0 時為 no-op 但仍在
+   生產路徑上）；hybrid_patches.py 的寫檔處加註指向
+   docs/RUNTIME-SOURCE-REWRITE-20260913.md
+---
+ .gitignore                                    |  2 ++
+ .../aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu   | 19 +++++++++++++++++--
+ .../sglang/srt/speculative/eagle_worker_v2.py | 14 ++++++++++++++
+ .../sglang/srt/speculative/hybrid_patches.py  |  2 ++
+ 4 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index 4e00c79..1f70f00 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -297,3 +297,5 @@ internal-docs/
+ # 唯一例外：deterministic_all_reduce.hip 是手寫來源（樹內無對應 .cu），必須保留。
+ *.hip
+ !python/sglang/kernels/aot/csrc/allreduce/deterministic_all_reduce.hip
++
++*.bak-*
+diff --git a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu
+index 264bf45..bd8d5a5 100644
+--- a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu
++++ b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu
+@@ -59,7 +59,9 @@ namespace gptq_rdna3_wmma {
+ //   SGL_WMMA_KSPLIT             0      強制 k_split 值（除錯用）           設 0
+ //   SGL_WMMA_VARIANT            0      量測變體分派                        **僅在
+ //                                      （需 -DSGL_WMMA_MEASUREMENT_BENCH）  量測建置中存在**
+-// 生產建置不含任何量測變體程式碼；詳見 docs/KERNEL-CLEANUP-AND-GIT-HYGIENE.md
++// 生產建置不含量測變體的分派程式碼，亦不含其 launcher 與模板具現化
++// （2026-09-13 review 更正：先前僅守衛分派表，launcher 本體仍在）；
++// 詳見 docs/KERNEL-CLEANUP-AND-GIT-HYGIENE.md
+ // ---------------------------------------------------------------------------
+ 
+ 
+@@ -269,7 +271,9 @@ __host__ __device__ static inline int compute_wmma_k_split(int size_k) {
+ //   5120 x 6144       384       0.09661  0.09436  0.09122  0.09996  k=16
+ //   5120 x 12288      768       0.17250  0.16021  0.16392  0.18090  k=8
+ //
+-// The rule below picks the measured optimum in 6/6 shapes. Weighted by the
++// The rule below picks the measured optimum in 5/6 shapes. The exception is
++// 17408x5120: its measured minimum is k=32 (0.22263) while the rule picks k=16
++// (0.22434), a 0.77% gap on that one shape. Weighted by the
+ // real layer mix (per-layer ms x layer count) it takes the M=16 verify GEMM
+ // from 67.45 ms to 62.14 ms, i.e. -7.9%.
+ //
+@@ -821,6 +825,15 @@ void launch_gemm_q4_wmma_16x16_1w(const T* a, const uint32_t* b_q_weight,
+       zero_offset, b_q_perm, partials);
+ }
+ 
++// ---------------------------------------------------------------------------
++// 量測專用 launcher：SFL / 16x32_2w / ABL。全部納入 SGL_WMMA_MEASUREMENT_BENCH。
++// 2026-09-13 review 更正：先前只守衛了檔尾的 SGL_WMMA_VARIANT 分派表，這三個
++// launcher 本體與其模板具現化仍留在生產 .so 內 —— 其中 ABL 分支刻意產生錯誤
++// 數值（見 kernel 內 ABL==2 的 z_f * 0.0f）。全部呼叫點都在檔尾受守衛的分派
++// 區塊內，故一併守衛不會斷編譯。
++// ---------------------------------------------------------------------------
++#ifdef SGL_WMMA_MEASUREMENT_BENCH
++
+ // DSH 2026-09-13: SFL variant - B fragment built by shfl_xor(16) instead of a
+ // b_lds round-trip. Measurement entry only (SGL_WMMA_VARIANT=1616).
+ template <typename T>
+@@ -883,6 +896,8 @@ void launch_gemm_q4_wmma_16x16_abl(const T* a, const uint32_t* b_q_weight,
+                                    b_q_perm, partials);
+ }
+ 
++#endif  // SGL_WMMA_MEASUREMENT_BENCH — SFL / 16x32_2w / ABL 量測 launcher
++
+ #if defined(__HIP__RDNA3__) || !defined(__HIP_DEVICE_COMPILE__)
+ 
+ // ===========================================================================
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index d196287..efc13c1 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -1,3 +1,16 @@
++# =============================================================================
++# ⚠ 此檔案已被機器改寫（2026-09-13 查明）
++#
++# hybrid_patches.py:1153-1176 會在執行期讀取本檔、替換鰈點字串、
++# 附加 _HELPER_SRC，然後就地寫回磁碟。以下為注入產物，
++# **非上游 SGLang 程式碼**：
++#   1) 呼叫點（兩處）：self.speculative_num_draft_tokens = _dsh_neural_ndt(...)
++#   2) 檔尾定義：def _dsh_neural_ndt(default)
++#
++# DSH_HYBRID=0 時 _dsh_neural_ndt 為 no-op（NEURAL_WIDTH 為空 dict），
++# 但呼叫仍在生產路徑上（NEXTN 每次建構都走）。
++# 機制、成因與還原方法：docs/RUNTIME-SOURCE-REWRITE-20260913.md
++# =============================================================================
+ import os
+ import contextlib
+ import logging
+@@ -1748,6 +1761,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
+         return success, message
+ 
+ 
++# --- 以下函式由 hybrid_patches.py 執行期注入（見檔頭標記）；非上游程式碼 ---
+ def _dsh_neural_ndt(default):
+     """容許 hybrid_controller 覆寫 draft 長度；非 HYBRID 模式下恆回傳 default。
+ 
+diff --git a/python/sglang/srt/speculative/hybrid_patches.py b/python/sglang/srt/speculative/hybrid_patches.py
+index b0d6574..5615bba 100644
+--- a/python/sglang/srt/speculative/hybrid_patches.py
++++ b/python/sglang/srt/speculative/hybrid_patches.py
+@@ -1173,6 +1173,8 @@ def patch_eagle_worker_width():
+     except SyntaxError as e:
+         logger.error("HYBRID: eagle width patch would break syntax: %s", e)
+         return False
++    # ⚠ 此行會永久改寫磁碟上的 eagle_worker_v2.py（非該檔任何 env 關閉時仍有效）。
++    # 已注入內容與還原方法：docs/RUNTIME-SOURCE-REWRITE-20260913.md
+     open(src_path, "w", encoding="utf-8").write(_src)
+     _ew._dsh_eagle_width_patched = True
+     logger.error("HYBRID-EAGLE: %d num_draft_tokens site(s) made neural-aware", n)
+-- 
+2.43.0
+

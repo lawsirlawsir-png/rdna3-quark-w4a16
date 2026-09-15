@@ -1,0 +1,63 @@
+From 40281ad5c0a0ccce2236cf4f88fc0273a76c36c9 Mon Sep 17 00:00:00 2001
+From: lawsir <lawsir@mac-mini-hermes>
+Date: Mon, 14 Sep 2026 10:02:27 +0800
+Subject: [PATCH 18/19] =?UTF-8?q?craft(W2):=20=E8=A3=9C=E6=8F=90=E4=BA=A4?=
+ =?UTF-8?q?=20P31/P51=20=E7=9A=84=20#ifdef=20=E5=AE=88=E8=A1=9B=EF=BC=88?=
+ =?UTF-8?q?=E5=B7=B2=E9=A9=97=E8=AD=89=20EQUIVALENT=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+4 行插入（2 組 #ifdef/#endif），包住 P31 launcher（16x16_4t）與 P51 kernel（4w_kernel）。
+
+驗證（so_equiv.py）：
+  生產 7847e12e vs 加守衛後重編 5f69cbf1
+  差異 62 位元組 = build-id 20 + __LINE__ 42 + 未歸因 0
+  符號表 3699/3699 相同  => EQUIVALENT（零指令差異）
+  量測 kernel 符號仍全為 0；生產 kernel gemm_q4_wmma_kernel_16x16_1w 仍有 4
+
+=> W2 的守衛確實零風險：量測碼本來就未被 instantiate，加守衛只是停止編譯它。
+本 .so 未部署，生產 .so 仍為 7847e12eaf3d8b10。
+---
+ python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu
+index 5e94362..d7280c0 100644
+--- a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu
++++ b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu
+@@ -839,6 +839,7 @@ void launch_gemm_q4_wmma_16x16_1w(const T* a, const uint32_t* b_q_weight,
+       zero_offset, b_q_perm, partials);
+ }
+ 
++  #ifdef SGL_WMMA_MEASUREMENT_BENCH  // P31: 量測專用，唔入生產 .so
+ // P31: MT=4 -> 128-thread block, 4 個獨立 16x16 tile（每 wave 一個）。
+ // 目的：把「每 CU 最多 16 個 block」的排程鉗子放寬 4 倍。
+ template <typename T>
+@@ -858,6 +859,7 @@ void launch_gemm_q4_wmma_16x16_4t(const T* a, const uint32_t* b_q_weight,
+                                    size_m, size_n, size_k, groups, zero_offset,
+                                    b_q_perm, partials);
+ }
++  #endif  // SGL_WMMA_MEASUREMENT_BENCH (P31)
+ 
+ 
+ 
+@@ -882,6 +884,7 @@ void launch_gemm_q4_wmma_16x16_4t(const T* a, const uint32_t* b_q_weight,
+ // ---------------------------------------------------------------------------
+ 
+ // ---------------------------------------------------------------------------
++  #ifdef SGL_WMMA_MEASUREMENT_BENCH  // P51: 量測專用，唔入生產 .so
+ // P51 (2026-09-13): 4-warp 64x64 結構 —— SGL_WMMA_VARIANT=2300
+ // 社區參考：hipfire commit be57d8d (gemm_q8_0_wmma_4w.hip)
+ //   "per-block weight reuse from 16x (single-warp 16x16) to 64x (4-warp 64x64)"
+@@ -995,6 +998,7 @@ __global__ void gemm_q4_wmma_4w_kernel(
+     }
+   }
+ }
++  #endif  // SGL_WMMA_MEASUREMENT_BENCH (P51)
+ 
+ 
+ // ---------------------------------------------------------------------------
+-- 
+2.43.0
+

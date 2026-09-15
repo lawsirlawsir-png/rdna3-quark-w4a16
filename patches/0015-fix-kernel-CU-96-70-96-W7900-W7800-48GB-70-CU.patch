@@ -1,0 +1,65 @@
+From 005ad71cd427fdd5697e7788de14189945db9aef Mon Sep 17 00:00:00 2001
+From: lawsir <lawsir@mac-mini-hermes>
+Date: Mon, 14 Sep 2026 08:55:54 +0800
+Subject: [PATCH 15/19] =?UTF-8?q?fix(kernel):=20=E6=9B=B4=E6=AD=A3=20CU=20?=
+ =?UTF-8?q?=E6=95=B8=2096=20->=2070=EF=BC=8896=20=E4=BF=82=20W7900?=
+ =?UTF-8?q?=EF=BC=9B=E6=9C=AC=E5=8D=A1=20W7800=2048GB=20=E4=BF=82=2070=20C?=
+ =?UTF-8?q?U=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+證據（雙來源互相印證）：
+- amd-smi static: NUM_COMPUTE_UNITS: 70
+- torch: 35 WGP x 64 wave32 slots = 2240 wave slots = 70 CU x 32
+文檔原寫 96 CU / 3072 wave slots，高估 CU 1.37 倍。
+
+改動：q_gemm_rdna3_wmma.cu/.hip 註解 3 處 + 在 kTargetBlocksXY 前加警示。
+**刻意不改 kTargetBlocksXY（仍為 1500）**：該值由錯誤的 3072 slots 推導，
+重推應約 1120，即現時啟發式過度 split 約 1.37 倍；但生產帶
+SGL_WMMA_KSPLIT_AUTO=1，改動會影響 prefill，必須先 A/B 量測。
+---
+ .../aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu       | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu
+index ce4a011..91c2a1a 100644
+--- a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu
++++ b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu
+@@ -295,12 +295,12 @@ __host__ __device__ static inline int choose_k_split_small_m(int size_m,
+ // Qwen-class K, which over-subscribes wave slots and pays the atomic CAS
+ // epilogue once-per-K-segment per output cell. With v3/v4/v5's larger
+ // tiles (64M × 16/32/64N) and 4 resident waves per block, the no-split
+-// grid is often already well-saturated on gfx1100's 96 CUs / 3072 wave
++// grid is often already well-saturated on gfx1100's 70 CUs / 2240 wave
+ // slots — adding gridDim.z just adds atomic overhead.
+ //
+ // Heuristic: compute the no-split block count gridDim.x × gridDim.y, then
+ // pick the smallest K_SPLIT that brings total waves to at least
+-// ~2× over-subscription (~6000 waves for our 3072 slots, i.e. 1500 blocks
++// ~2× over-subscription (~4480 waves for our 2240 slots, i.e. 1120 blocks
+ // at 4 waves/block). Above that threshold, K_SPLIT=1 — direct write, no
+ // atomic.
+ //
+@@ -314,8 +314,17 @@ __host__ __device__ static inline int compute_wmma_k_split_mn(
+     int size_m, int size_n, int size_k, int m_tile, int n_tile) {
+   const int blocks_xy =
+       ((size_n + n_tile - 1) / n_tile) * ((size_m + m_tile - 1) / m_tile);
+-  // Target: enough blocks to keep ~2× oversubscription on 96 CUs / 3072
++  // Target: enough blocks to keep ~2× oversubscription on 70 CUs / 2240
+   // wave slots at 4 waves/block ⇒ ~1500 blocks no-split.
++  // !! kTargetBlocksXY=1500 was derived from a WRONG CU count: it assumed
++  // gfx1100 has 70 CUs / 2240 wave slots (that is the W7900). This card
++  // (Radeon PRO W7800 48GB) has 70 CUs / 2240 wave32 slots, verified by
++  // `amd-smi static` (NUM_COMPUTE_UNITS: 70) and torch
++  // (35 WGPs x 64 wave32 slots = 2240). Re-derived 2x oversubscription would
++  // be ~4480 waves / 4 waves-per-block ~= 1120 blocks, i.e. this heuristic
++  // currently OVER-SPLITS by ~1.37x. NOT changed here: altering it changes
++  // production prefill behaviour (SGL_WMMA_KSPLIT_AUTO=1 is live) and must be
++  // A/B measured first. See sgl-hybrid-recipes docs/CURRENT-TRUTH.md.
+   constexpr int kTargetBlocksXY = 1500;
+   if (blocks_xy >= kTargetBlocksXY) return 1;
+   if (blocks_xy * 2 >= kTargetBlocksXY && size_k >= 512 && size_k % 32 == 0)
+-- 
+2.43.0
+

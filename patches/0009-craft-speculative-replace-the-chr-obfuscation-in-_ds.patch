@@ -1,0 +1,49 @@
+From 89fd41686b46dcea6469fd344a197bae8d21d179 Mon Sep 17 00:00:00 2001
+From: lawsir <lawsir@mac-mini-hermes>
+Date: Sun, 13 Sep 2026 10:33:14 +0800
+Subject: [PATCH 09/19] craft(speculative): replace the chr() obfuscation in
+ _dsh_neural_ndt
+
+The function looked up NEURAL_WIDTH[chr(110)+chr(101)+chr(117)+chr(114)+chr(97)+chr(108)],
+which spells "neural". Building an ordinary string literal out of chr() calls has
+no legitimate purpose - its only effect is to evade a grep for the word.
+
+Replaced with the literal, added a docstring stating what the function does and
+that hybrid_controller is dead code under DSH_HYBRID=0 (so NEURAL_WIDTH is empty
+and the function is a production no-op), and narrowed the except from bare
+Exception to ImportError so genuine errors are no longer swallowed.
+
+py_compile passes. Takes effect on the next restart.
+---
+ python/sglang/srt/speculative/eagle_worker_v2.py | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index c75127f..d196287 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -1749,11 +1749,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
+ 
+ 
+ def _dsh_neural_ndt(default):
++    """容許 hybrid_controller 覆寫 draft 長度；非 HYBRID 模式下恆回傳 default。
++
++    原寫法用 chr(110)+chr(101)+chr(117)+chr(114)+chr(97)+chr(108) 拼出 "neural"，
++    唯一效果是避開 grep——不可接受，已改回字面量。
++
++    註：hybrid_controller 在生產是死碼（DSH_HYBRID=0），其 NEURAL_WIDTH 為空 dict，
++    故此函式在生產等同 no-op；保留是為了 DSH_HYBRID=1 的實驗路徑。
++    """
+     try:
+         from sglang.srt.speculative.hybrid_controller import NEURAL_WIDTH
+-        nw = NEURAL_WIDTH.get(chr(110)+chr(101)+chr(117)+chr(114)+chr(97)+chr(108))
++        nw = NEURAL_WIDTH.get("neural")
+         if nw:
+             return int(nw)
+-    except Exception:
++    except ImportError:
+         pass
+     return default
+-- 
+2.43.0
+

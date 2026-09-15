@@ -1,0 +1,43 @@
+From b10a8aba292c9eab68a60bb037733747fa3eb144 Mon Sep 17 00:00:00 2001
+From: huannong <huannong@local>
+Date: Sat, 12 Sep 2026 12:33:26 +0800
+Subject: [PATCH 03/19] fix(triton verify): exclude irregular (NGRAM) trees
+ from mask-less unified verify kernel
+
+The vendored vLLM unified verify kernel (SGL_RDNA_VLLM_VERIFY=1) takes NO mask argument, so it is only valid for a regular causal-chain verify tree (tree_topk == 1). NGRAM corpus-BFS builds an IRREGULAR branching tree (NgramVerifyInput.tree_topk == -1) passed as spec_info.custom_mask; routing it through the mask-less kernel silently computed wrong attention for every draft node past the first branch, diverging generation from plain greedy decode and degenerating into repetition loops.
+---
+ .../sglang/srt/layers/attention/triton_backend.py | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglang/srt/layers/attention/triton_backend.py
+index 752640a..bb82fbd 100644
+--- a/python/sglang/srt/layers/attention/triton_backend.py
++++ b/python/sglang/srt/layers/attention/triton_backend.py
+@@ -1835,10 +1835,23 @@ class TritonAttnBackend(AttentionBackend):
+             and self.forward_metadata.rdna_full_kv_indptr is not None
+             and self.forward_metadata.rdna_extend_ocl is not None
+         )
++        # 2026-09-12 FIX (irregular-tree gate)
++        # The vendored kernel takes NO mask argument, so it is valid only when
++        # the verify tree is a regular causal chain (tree_topk == 1). NGRAM's
++        # corpus BFS builds an IRREGULAR branching tree
++        # (NgramVerifyInput.tree_topk == -1) handed over as
++        # spec_info.custom_mask; routing that through the mask-less unified
++        # kernel silently computed wrong attention for every draft node past
++        # the first branch and diverged generation from plain greedy decode.
++        _spec_topk = getattr(
++            getattr(forward_batch, "spec_info", None), "tree_topk", 1
++        )
++        _tree_is_chain = _spec_topk == 1
+         if (
+             self.rdna_verify_enabled
+             and (
+-                forward_batch.forward_mode.is_target_verify() or _is_de_v2
++                (forward_batch.forward_mode.is_target_verify() and _tree_is_chain)
++                or _is_de_v2
+             )
+             and score_mod is None
+             and sinks is None
+-- 
+2.43.0
+

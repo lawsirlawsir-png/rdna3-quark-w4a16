@@ -1,0 +1,137 @@
+From d52add76163ef86ad24213135081320f84ac69a8 Mon Sep 17 00:00:00 2001
+From: lawsir <lawsir@mac-mini-hermes>
+Date: Sun, 13 Sep 2026 10:46:23 +0800
+Subject: [PATCH 11/19] craft(speculative): mark the five unused hybrid modules
+ with a STATUS header
+
+---
+ .../sglang/srt/speculative/hybrid_controller.py  | 16 ++++++++++++++++
+ python/sglang/srt/speculative/hybrid_info.py     | 16 ++++++++++++++++
+ python/sglang/srt/speculative/hybrid_patches.py  | 16 ++++++++++++++++
+ python/sglang/srt/speculative/hybrid_register.py | 16 ++++++++++++++++
+ .../sglang/srt/speculative/ngram_fill_helper.py  | 16 ++++++++++++++++
+ 5 files changed, 80 insertions(+)
+
+diff --git a/python/sglang/srt/speculative/hybrid_controller.py b/python/sglang/srt/speculative/hybrid_controller.py
+index 4d40e9d..0b3cfd8 100644
+--- a/python/sglang/srt/speculative/hybrid_controller.py
++++ b/python/sglang/srt/speculative/hybrid_controller.py
+@@ -1,3 +1,19 @@
++# =============================================================================
++# STATUS: 未投產（UNUSED IN PRODUCTION）— 2026-09-13 審計確認
++#
++# 生產設定 DSH_HYBRID=0（start-server.sh:12），本檔在生產完全不會被載入。
++# 證據與完整判定見 docs/HYBRID-STATUS.md。
++#
++# ⚠️ 載入閘門：spec_registry.py:284 與 :297 兩道 gate 都在 import 之前 return；
++#    hybrid_register.py:50 亦有同樣的 gate。
++#
++# ⚠️ 已知地雷：spec_registry.py 的 _dsh_load_hybrid_patches() 其 docstring 自述
++#    「任何 spec 算法載入時都安裝」，而唯一守門是 DSH_HYBRID。
++#    即 DSH_HYBRID=1 搭配 NEXTN 會把 15 個 monkey-patch 裝上生產物件。
++#    **開啟前必須先修此閘門使其同時檢查算法。**
++#
++# 本檔僅為 DSH_HYBRID=1 的實驗路徑保留；如確定不再使用，可移入 attic/。
++# =============================================================================
+ # -*- coding: utf-8 -*-
+ """gfx1100 通用 HYBRID speculative decoding：NGRAM（retrieval）× DFLASH（neural）
+ 
+diff --git a/python/sglang/srt/speculative/hybrid_info.py b/python/sglang/srt/speculative/hybrid_info.py
+index 581a16a..9b3589d 100644
+--- a/python/sglang/srt/speculative/hybrid_info.py
++++ b/python/sglang/srt/speculative/hybrid_info.py
+@@ -1,3 +1,19 @@
++# =============================================================================
++# STATUS: 未投產（UNUSED IN PRODUCTION）— 2026-09-13 審計確認
++#
++# 生產設定 DSH_HYBRID=0（start-server.sh:12），本檔在生產完全不會被載入。
++# 證據與完整判定見 docs/HYBRID-STATUS.md。
++#
++# ⚠️ 載入閘門：spec_registry.py:284 與 :297 兩道 gate 都在 import 之前 return；
++#    hybrid_register.py:50 亦有同樣的 gate。
++#
++# ⚠️ 已知地雷：spec_registry.py 的 _dsh_load_hybrid_patches() 其 docstring 自述
++#    「任何 spec 算法載入時都安裝」，而唯一守門是 DSH_HYBRID。
++#    即 DSH_HYBRID=1 搭配 NEXTN 會把 15 個 monkey-patch 裝上生產物件。
++#    **開啟前必須先修此閘門使其同時檢查算法。**
++#
++# 本檔僅為 DSH_HYBRID=1 的實驗路徑保留；如確定不再使用，可移入 attic/。
++# =============================================================================
+ # -*- coding: utf-8 -*-
+ """HYBRID verify-input 狀態隔離（DFLASH 版，原創）。
+ 
+diff --git a/python/sglang/srt/speculative/hybrid_patches.py b/python/sglang/srt/speculative/hybrid_patches.py
+index 1acbe16..b0d6574 100644
+--- a/python/sglang/srt/speculative/hybrid_patches.py
++++ b/python/sglang/srt/speculative/hybrid_patches.py
+@@ -1,3 +1,19 @@
++# =============================================================================
++# STATUS: 未投產（UNUSED IN PRODUCTION）— 2026-09-13 審計確認
++#
++# 生產設定 DSH_HYBRID=0（start-server.sh:12），本檔在生產完全不會被載入。
++# 證據與完整判定見 docs/HYBRID-STATUS.md。
++#
++# ⚠️ 載入閘門：spec_registry.py:284 與 :297 兩道 gate 都在 import 之前 return；
++#    hybrid_register.py:50 亦有同樣的 gate。
++#
++# ⚠️ 已知地雷：spec_registry.py 的 _dsh_load_hybrid_patches() 其 docstring 自述
++#    「任何 spec 算法載入時都安裝」，而唯一守門是 DSH_HYBRID。
++#    即 DSH_HYBRID=1 搭配 NEXTN 會把 15 個 monkey-patch 裝上生產物件。
++#    **開啟前必須先修此閘門使其同時檢查算法。**
++#
++# 本檔僅為 DSH_HYBRID=1 的實驗路徑保留；如確定不再使用，可移入 attic/。
++# =============================================================================
+ # -*- coding: utf-8 -*-
+ """HYBRID 嘅加法式 patch：唔改上游核心檔，用 monkey-patch 補齊接口。"""
+ import logging
+diff --git a/python/sglang/srt/speculative/hybrid_register.py b/python/sglang/srt/speculative/hybrid_register.py
+index 03dc9f3..046e00f 100644
+--- a/python/sglang/srt/speculative/hybrid_register.py
++++ b/python/sglang/srt/speculative/hybrid_register.py
+@@ -1,3 +1,19 @@
++# =============================================================================
++# STATUS: 未投產（UNUSED IN PRODUCTION）— 2026-09-13 審計確認
++#
++# 生產設定 DSH_HYBRID=0（start-server.sh:12），本檔在生產完全不會被載入。
++# 證據與完整判定見 docs/HYBRID-STATUS.md。
++#
++# ⚠️ 載入閘門：spec_registry.py:284 與 :297 兩道 gate 都在 import 之前 return；
++#    hybrid_register.py:50 亦有同樣的 gate。
++#
++# ⚠️ 已知地雷：spec_registry.py 的 _dsh_load_hybrid_patches() 其 docstring 自述
++#    「任何 spec 算法載入時都安裝」，而唯一守門是 DSH_HYBRID。
++#    即 DSH_HYBRID=1 搭配 NEXTN 會把 15 個 monkey-patch 裝上生產物件。
++#    **開啟前必須先修此閘門使其同時檢查算法。**
++#
++# 本檔僅為 DSH_HYBRID=1 的實驗路徑保留；如確定不再使用，可移入 attic/。
++# =============================================================================
+ # -*- coding: utf-8 -*-
+ """註冊 HYBRID 算法（供 spec_registry 延遲載入呼叫）。"""
+ import logging
+diff --git a/python/sglang/srt/speculative/ngram_fill_helper.py b/python/sglang/srt/speculative/ngram_fill_helper.py
+index 83f41cd..2c97ab2 100644
+--- a/python/sglang/srt/speculative/ngram_fill_helper.py
++++ b/python/sglang/srt/speculative/ngram_fill_helper.py
+@@ -1,3 +1,19 @@
++# =============================================================================
++# STATUS: 未投產（UNUSED IN PRODUCTION）— 2026-09-13 審計確認
++#
++# 生產設定 DSH_HYBRID=0（start-server.sh:12），本檔在生產完全不會被載入。
++# 證據與完整判定見 docs/HYBRID-STATUS.md。
++#
++# ⚠️ 載入閘門：spec_registry.py:284 與 :297 兩道 gate 都在 import 之前 return；
++#    hybrid_register.py:50 亦有同樣的 gate。
++#
++# ⚠️ 已知地雷：spec_registry.py 的 _dsh_load_hybrid_patches() 其 docstring 自述
++#    「任何 spec 算法載入時都安裝」，而唯一守門是 DSH_HYBRID。
++#    即 DSH_HYBRID=1 搭配 NEXTN 會把 15 個 monkey-patch 裝上生產物件。
++#    **開啟前必須先修此閘門使其同時檢查算法。**
++#
++# 本檔僅為 DSH_HYBRID=1 的實驗路徑保留；如確定不再使用，可移入 attic/。
++# =============================================================================
+ # -*- coding: utf-8 -*-
+ """NGRAM x DFLASH 組合式草稿填充（#2 POC v1）
+ 
+-- 
+2.43.0
+

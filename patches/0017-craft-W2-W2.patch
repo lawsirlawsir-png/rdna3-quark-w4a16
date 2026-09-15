@@ -1,0 +1,80 @@
+From 30d229589e0f455b676d5390f8f5bdb593d94d58 Mon Sep 17 00:00:00 2001
+From: lawsir <lawsir@mac-mini-hermes>
+Date: Mon, 14 Sep 2026 09:24:55 +0800
+Subject: [PATCH 17/19] =?UTF-8?q?craft(W2):=20=E8=90=BD=E5=AF=A6=E5=85=A9?=
+ =?UTF-8?q?=E8=99=95=E8=A8=BB=E8=A7=A3=E4=BF=AE=E6=AD=A3=EF=BC=88=E7=94=A8?=
+ =?UTF-8?q?=E5=85=A7=E5=AE=B9=E9=8C=A8=E5=AE=9A=EF=BC=8C=E9=9D=9E=20W2=20?=
+ =?UTF-8?q?=E5=8E=9F=E8=A3=9C=E4=B8=81=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+W2 原補丁不可用：git apply --check 報 corrupt patch at line 33，
+且 hunk 3/6 的 - 行在宣稱位置對不上（行號系統性偏移 +9~+12）。故由總管
+用內容錨定重建，對 .cu 與 .hip 同時施加。
+
+修正一（量測 launcher 註解）：原稱三個 launcher 本體「仍留在生產 .so 內」，
+2026-09-14 親查符號表後更正為「一度留在」，並附核實指令、以及
+切勿用 /tmp 副本對證的警告（實測 /tmp/newpkg sha 已變為 7f423adb）。
+
+修正二（zero-init 註解）：原稱 Always zero-init，但代碼係
+deterministic ? torch::empty : torch::zeros，兩者矛盾。改為準確描述：
+只有非確定性（legacy CAS）路徑需要 zero-init。
+
+改動純註解：22 insertions / 8 deletions，非註解新增行 = 0，
+不影響 codegen，生產 .so 不變。
+---
+ .../aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu   | 30 ++++++++++++++-----
+ 1 file changed, 22 insertions(+), 8 deletions(-)
+
+diff --git a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu
+index 91c2a1a..5e94362 100644
+--- a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu
++++ b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu
+@@ -865,10 +865,20 @@ void launch_gemm_q4_wmma_16x16_4t(const T* a, const uint32_t* b_q_weight,
+ 
+ // ---------------------------------------------------------------------------
+ // 量測專用 launcher：SFL / 16x32_2w / ABL。全部納入 SGL_WMMA_MEASUREMENT_BENCH。
+-// 2026-09-13 review 更正：先前只守衛了檔尾的 SGL_WMMA_VARIANT 分派表，這三個
+-// launcher 本體與其模板具現化仍留在生產 .so 內 —— 其中 ABL 分支刻意產生錯誤
+-// 數值（見 kernel 內 ABL==2 的 z_f * 0.0f）。全部呼叫點都在檔尾受守衛的分派
+-// 區塊內，故一併守衛不會斷編譯。
++// 2026-09-13 review：先前只守衛了檔尾的 SGL_WMMA_VARIANT 分派表，這三個 launcher
++// 本體與其模板具現化「一度」留在生產 .so 內 —— 其中 ABL 分支刻意產生錯誤數值
++// （見 kernel 內 ABL==2 的 z_f * 0.0f）。
++//
++// 2026-09-14 對證（總管親查，非轉述）：生產 .so 符號表內
++// `16x16_4t` / `4w_kernel` / `iu4_nolds` / `16x32_2w` 出現數皆為 0
++// ⇒ 量測 kernel 已確實唔喺生產 .so。核實方法：
++//   P=$(ss -ltnp | grep :8080 | grep -o "pid=[0-9]*" | cut -d= -f2)
++//   llvm-objdump -t $(grep -o "/[^ ]*common_ops[^ ]*" /proc/$P/maps | sort -u) | grep -c 4w_kernel
++// ⚠️ 切勿改用 /tmp 嘅 .so 副本做此對證 —— 2026-09-14 發現 gatewrap.py 硬編碼嘅
++//    /tmp/newpkg 副本 sha 已變（7f423adb），與生產（7847e12e）不符。
++//
++// 註：P31/P51 之 #ifdef 守衛尚未施加（需一次重編譯 + objdump 對證 + regression）。
++// 全部呼叫點都在檔尾受守衛的分派區塊內，故一併守衛不會斷編譯。
+ // ---------------------------------------------------------------------------
+ 
+ // ---------------------------------------------------------------------------
+@@ -3098,10 +3108,14 @@ torch::Tensor gptq_gemm_rdna3_wmma(torch::Tensor a, torch::Tensor b_q_weight,
+   TORCH_CHECK(size_k % 16 == 0, "WMMA path requires K % 16 == 0");
+ 
+   auto opts = torch::TensorOptions().dtype(a.dtype()).device(a.device());
+-  // Always zero-init the output: some V3-V8 boundary threads may exit
+-  // without writing their output cell (e.g. out_m >= size_m), leaving
+-  // uninitialized garbage when torch::empty is used.  The cost is
+-  // negligible (< 1.5% of prefill time on gfx1100).
++  // Zero-init the output ONLY on the non-deterministic (legacy CAS) path:
++  // some V3-V8 boundary threads may exit without writing their cell
++  // (e.g. out_m >= size_m), leaving uninitialized garbage. The deterministic
++  // (reduce-pass) path writes every output cell exactly once, so torch::empty
++  // is safe there -- see the `deterministic ? empty : zeros` below.
++  // Zero-init cost is < 1.5% of prefill time on gfx1100.
++  // (2026-09-14: this comment used to say "Always zero-init", contradicting the
++  //  code. It was reported by craft review W2 and corrected here.)
+   static const bool kLegacyEpilogue = []() {
+     const char* e = ::getenv("SGL_RDNA3_LEGACY_CAS_EPILOGUE");
+     return e != nullptr && e[0] == '1';
+-- 
+2.43.0
+

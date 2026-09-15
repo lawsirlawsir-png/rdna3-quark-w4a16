@@ -1,0 +1,68 @@
+From c2d509e3c974fc8e571baf38406ca9395d96081b Mon Sep 17 00:00:00 2001
+From: lawsir <lawsir@mac-mini-hermes>
+Date: Fri, 11 Sep 2026 08:06:14 +0800
+Subject: [PATCH 02/19] =?UTF-8?q?perf(rocm):=20=E5=B0=8F=20M=20WMMA=20?=
+ =?UTF-8?q?=E9=96=80=E6=AA=BB=E4=B8=8B=E7=A7=BB=E8=87=B3=20M>=3D9=EF=BC=88?=
+ =?UTF-8?q?decode=20verify=20step=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+問題：分派門檻為 bf16 M>=16 / fp16 M>=64，而 DFLASH（ndraft 8）之 verify
+step 為 M=9，永遠落在 scalar 路徑。實測 scalar 於 M=9 由分塊上限 8
+（gptq_kernel.cu BLOCK_M_SIZE_MAX=8）拆成 8+1，成本較 M=8 跳 +74%；
+WMMA tile 固定 16 行故 M>=9 後平坦 → 交叉點恰為 M=9。
+
+改動：門檻改為 M>=9 && N>=2048（N 下限排除窄 N 之 kv_proj N=1024，
+其 WMMA 反而慢 ~7%）。.cu 與 .hip 同步修改。
+
+驗證：
+- 隔離量測：M=9 GEMM 246.7us -> 185.9us（-24.6%）；M=1/4/8 不變。
+- 數值：直接呼叫 WMMA 與 scalar 於 M<16 最大相對差 ~1e-2，
+  且 16x16 kernel 有 m_tile>=size_m 守衛 → 正確性無虞。
+- 護欄 kernel_regression.py：C1 36 組 PASS（最差 rel_err 3.64e-02）。
+- E2E（code_fib，10 reps x 2 輪交替）：smallm 2.467/2.485s vs
+  force_scalar 2.563/2.529s → +1.8~3.9%（合併約 +2.8%）。
+
+已知：E2E 同 config 重跑離散可達 ±8%（3 reps 時），故 3 reps 之量測
+不足以判定；上列數字用 10 reps 並交替 config 取得。
+---
+ python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu  | 5 +++--
+ python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.hip | 5 +++--
+ 2 files changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu
+index 2fafd5e..44ade72 100644
+--- a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu
++++ b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu
+@@ -739,8 +739,9 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
+   // counterfactual switch for the WMMA-wedge bisect (12.165).
+   if (a.dim() == 2 && b_q_weight.dim() == 2 &&
+       a.size(1) % 16 == 0 && b_q_weight.size(1) % 16 == 0 &&
+-      ((a.scalar_type() == torch::kBFloat16 && a.size(0) >= 16) ||
+-       (a.scalar_type() == torch::kHalf && a.size(0) >= 64))) {
++      // 花農 2026-09-11: 小 M 門檻下移（實測交叉點 M>=9；scalar 於 M=9 拆 8+1
++      // block 成本 +74%，WMMA tile 固定 16 行故平坦）。N>=2048 排除窄 N。
++      a.size(0) >= 9 && b_q_weight.size(1) >= 2048) {
+     return gptq_gemm_rdna3_wmma(a, b_q_weight, b_qzeros, b_scales, b_g_idx,
+                                 use_v2_format);
+   }
+diff --git a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.hip b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.hip
+index 9cc64f3..80b0aaa 100644
+--- a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.hip
++++ b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.hip
+@@ -740,8 +740,9 @@ torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
+   // counterfactual switch for the WMMA-wedge bisect (12.165).
+   if (a.dim() == 2 && b_q_weight.dim() == 2 &&
+       a.size(1) % 16 == 0 && b_q_weight.size(1) % 16 == 0 &&
+-      ((a.scalar_type() == torch::kBFloat16 && a.size(0) >= 16) ||
+-       (a.scalar_type() == torch::kHalf && a.size(0) >= 64))) {
++      // 花農 2026-09-11: 小 M 門檻下移（實測交叉點 M>=9；scalar 於 M=9 拆 8+1
++      // block 成本 +74%，WMMA tile 固定 16 行故平坦）。N>=2048 排除窄 N。
++      a.size(0) >= 9 && b_q_weight.size(1) >= 2048) {
+     return gptq_gemm_rdna3_wmma(a, b_q_weight, b_qzeros, b_scales, b_g_idx,
+                                 use_v2_format);
+   }
+-- 
+2.43.0
+

@@ -1,0 +1,566 @@
+From 0ecaa128b700c0dcc58025c991cdacb632264b6a Mon Sep 17 00:00:00 2001
+From: DSH <dsh@local>
+Date: Sun, 13 Sep 2026 22:24:02 +0800
+Subject: [PATCH 13/19] =?UTF-8?q?state(kernel):=20=E4=BB=A4=E5=B7=A5?=
+ =?UTF-8?q?=E4=BD=9C=E6=A8=B9=20=3D=3D=20=E7=94=9F=E7=94=A2=20.so=20?=
+ =?UTF-8?q?=E4=B9=8B=E5=BB=BA=E6=A7=8B=E4=BE=86=E6=BA=90?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+兩個檔一直有未提交改動，令「生產源碼狀態」無法從 git 判斷：
+
+1. q_gemm_rdna3.cu — split-K K-per-block 256->512（N-per-block 維持 THREADS_X*4=1024，
+   解耦），新增 KPT = BLOCK_KN_SIZE/THREADS_X，A 載入與 as_smem 歸約改為 KPT 迴圈。
+   fp64 gate: FAILURES=0 (M=1..32, maxulp<=1)。微基準 paired ratio 1.037 (control 0.998)。
+   **尚未部署到生產。**
+
+2. q_gemm_rdna3_wmma.cu — P31/P51/P60 量測變體（+342/-11）：
+   新增 MT 模板參數（預設 1，MT=1 時語義等同原版）、launch_gemm_q4_wmma_16x16_4t、
+   P60 iu4 no-LDS kernel（後者已由 #ifdef SGL_WMMA_MEASUREMENT_BENCH 隔離）。
+   呢啲係呢輪實驗遺留，之前一直未被提交，即係生產 .so 係由含未提交代碼嘅工作樹建出。
+
+此 commit 唔改任何行為，只係消除「源碼狀態說不清」嘅風險。
+---
+ .../aot/csrc/gemm/gptq/q_gemm_rdna3.cu        |  61 +--
+ .../aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu   | 353 +++++++++++++++++-
+ 2 files changed, 379 insertions(+), 35 deletions(-)
+
+diff --git a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu
+index 3ce08a8..76350bc 100644
+--- a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu
++++ b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3.cu
+@@ -76,7 +76,7 @@ namespace gptq_rdna3 {
+ // breaking memory-latency hiding for the fp16 path which is already
+ // memory-bound. Reverted to 256; bf16 keeps most of its gains from the
+ // fp32 dequant rewrite alone.
+-#define BLOCK_KN_SIZE 256
++#define BLOCK_KN_SIZE 512
+ #define THREADS_X 256
+ 
+ // Device code below is RDNA3-only; non-RDNA3 device passes fall through to
+@@ -276,7 +276,7 @@ __global__ void gemm_q4_kernel_rdna3(
+     // accumulating a low-precision partial into c. See the epilogue below.
+     float* __restrict__ partials) {
+   const int t = threadIdx.x;
+-  const int offset_n = blockIdx.x * BLOCK_KN_SIZE * 4;
++  const int offset_n = blockIdx.x * (THREADS_X * 4);
+   const int offset_m = blockIdx.y * M_COUNT;
+   const int offset_k = blockIdx.z * BLOCK_KN_SIZE;
+   const int end_k = min(offset_k + BLOCK_KN_SIZE, size_k);
+@@ -306,28 +306,33 @@ __global__ void gemm_q4_kernel_rdna3(
+   // read the SAME 8-element A window per inner step (a_off is uniform across
+   // the block), so the cache-line broadcast through L1 makes global reads as
+   // cheap as LDS reads. Measured: ~1% on 4B b=1, ~6% on 27B b=1 in=128.
+-  static_assert(BLOCK_KN_SIZE == THREADS_X,
+-                "BLOCK_KN_SIZE must equal THREADS_X (1 K element per thread)");
++  static_assert(BLOCK_KN_SIZE % THREADS_X == 0,
++                "BLOCK_KN_SIZE must be a multiple of THREADS_X");
++  constexpr int KPT = BLOCK_KN_SIZE / THREADS_X;  // K elements per thread
+   // The M=1 fast path (skip LDS) only has a global-read code path for bf16
+   // (the v_dot2_f32_bf16 branch).  The fp16 inner loop still indexes
+   // block_a[m][a_off] unconditionally, so for fp16 we MUST stage A through
+   // LDS even at M=1 to avoid reading uninitialized shared memory.
+   constexpr bool USE_LDS_A = (M_COUNT > 1) || std::is_same<T, half>::value;
+   if constexpr (USE_LDS_A) {
+-    if (offset_k + t < end_k) {
+   #pragma unroll
+-      for (int m = 0; m < M_COUNT; ++m) {
+-        T av;
+-        if (offset_m + m < size_m) {
+-          const T* a_row = a + (offset_m + m) * size_k;
+-          if (b_q_perm)
+-            av = a_row[b_q_perm[offset_k + t]];
+-          else
+-            av = a_row[offset_k + t];
+-        } else {
+-          av = tzero<T>();  // zero-pad invalid M rows
++    for (int kk = 0; kk < KPT; ++kk) {
++      const int tt = t + kk * THREADS_X;
++      if (offset_k + tt < end_k) {
++  #pragma unroll
++        for (int m = 0; m < M_COUNT; ++m) {
++          T av;
++          if (offset_m + m < size_m) {
++            const T* a_row = a + (offset_m + m) * size_k;
++            if (b_q_perm)
++              av = a_row[b_q_perm[offset_k + tt]];
++            else
++              av = a_row[offset_k + tt];
++          } else {
++            av = tzero<T>();  // zero-pad invalid M rows
++          }
++          block_a[m][tt] = av;
+         }
+-        block_a[m][t] = av;
+       }
+     }
+ 
+@@ -344,14 +349,18 @@ __global__ void gemm_q4_kernel_rdna3(
+         for (int g = 0; g < BLOCK_KN_SIZE / 32; ++g) as_smem[m][g] = 0.0f;
+       }
+       __syncthreads();
+-      const int g_loc = t / b2_gs;
+       const int ng_loc = BLOCK_KN_SIZE / b2_gs;
+   #pragma unroll
+-      for (int m = 0; m < M_COUNT; ++m) {
+-        float v = (offset_k + t < end_k) ? (float)block_a[m][t] : 0.0f;
++      for (int kk = 0; kk < KPT; ++kk) {
++        const int tt = t + kk * THREADS_X;
++        const int g_loc = tt / b2_gs;
+   #pragma unroll
+-        for (int off = 16; off > 0; off >>= 1) v += __shfl_down(v, off);
+-        if ((t & 31) == 0 && g_loc < ng_loc) atomicAdd(&as_smem[m][g_loc], v);
++        for (int m = 0; m < M_COUNT; ++m) {
++          float v = (offset_k + tt < end_k) ? (float)block_a[m][tt] : 0.0f;
++  #pragma unroll
++          for (int off = 16; off > 0; off >>= 1) v += __shfl_down(v, off);
++          if ((tt & 31) == 0 && g_loc < ng_loc) atomicAdd(&as_smem[m][g_loc], v);
++        }
+       }
+       __syncthreads();
+     }
+@@ -360,8 +369,12 @@ __global__ void gemm_q4_kernel_rdna3(
+     // and cannot apply act-order. When a permutation is present, stage the
+     // single A row through LDS (as fp16 / M>1 do) so the read picks it up.
+     // b_q_perm is block-uniform, so the __syncthreads is non-divergent.
+-    if (offset_k + t < end_k)
+-      block_a[0][t] = a[offset_m * size_k + b_q_perm[offset_k + t]];
++  #pragma unroll
++    for (int kk = 0; kk < KPT; ++kk) {
++      const int tt = t + kk * THREADS_X;
++      if (offset_k + tt < end_k)
++        block_a[0][tt] = a[offset_m * size_k + b_q_perm[offset_k + tt]];
++    }
+     __syncthreads();
+   }
+   if (n >= size_n) return;
+@@ -749,7 +762,7 @@ void launch_gemm_q4_for_mcount(const T* a, const uint32_t* b_q_weight,
+                                int zero_offset, float* partials,
+                                cudaStream_t stream) {
+   dim3 block(THREADS_X);
+-  dim3 grid((size_n + BLOCK_KN_SIZE * 4 - 1) / (BLOCK_KN_SIZE * 4),
++  dim3 grid((size_n + THREADS_X * 4 - 1) / (THREADS_X * 4),
+             (size_m + M_COUNT - 1) / M_COUNT,
+             (size_k + BLOCK_KN_SIZE - 1) / BLOCK_KN_SIZE);
+ 
+diff --git a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu
+index bd8d5a5..ce4a011 100644
+--- a/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu
++++ b/python/sglang/kernels/aot/csrc/gemm/gptq/q_gemm_rdna3_wmma.cu
+@@ -416,7 +416,7 @@ __device__ __forceinline__ bf16_t tzero<bf16_t>() {
+ // ===========================================================================
+ 
+ template <typename T, bool SFL = false, int NT = 16, int ABL = 0, int NACC = 1,
+-          int PF = 0>
++          int PF = 0, int MT = 1>
+ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+     const T* __restrict__ a, const uint32_t* __restrict__ b_q,
+     const uint32_t* __restrict__ b_qzeros, const T* __restrict__ b_scales,
+@@ -426,17 +426,21 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+   using E = typename WmmaNative<T>::elem;
+   using V16 = typename WmmaNative<T>::v16;
+ 
+-  const int m_tile = blockIdx.y * 16;
+-  const int n_tile = blockIdx.x * NT + ((NT == 16) ? 0 : (threadIdx.x >> 5)) * 16;
+-  if (m_tile >= size_m || n_tile >= size_n) {
+-    return;
+-  }
+-
+   // DSH 2026-09-13: NT = N-tile width in columns (16 or 32). With NT=32
+   // the block is 2 waves; each wave owns an independent 16N slice and
+   // its own accumulator chain, while A is shared (same rows, same K).
+   const int lane = threadIdx.x & 31;  // 0..31
+-  const int wave = (NT == 16) ? 0 : (threadIdx.x >> 5);
++  // P31: MT>1 時一個 block 有 MT 個 wave，每 wave 一個 16x16 tile。
++  const int wave = (MT > 1) ? (threadIdx.x >> 5) : ((NT == 16) ? 0 : (threadIdx.x >> 5));
++
++  // P31: MT>1 → 一個 block 內 MT 個 wave 各自負責一個 16x16 tile
++  const int n_tile = (MT > 1)
++      ? (blockIdx.x * 16 * MT + wave * 16)
++      : (blockIdx.x * NT + ((NT == 16) ? 0 : wave) * 16);
++  const int m_tile = blockIdx.y * 16;
++  if (m_tile >= size_m || n_tile >= size_n) {
++    return;
++  }
+   const int lane_lo = lane & 15;  // row index within fragment
+   const int lane_hi = lane >> 4;  // 0 or 1
+ 
+@@ -469,6 +473,7 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+   // DSH 2026-09-13: PF=1 software-pipelines the three B-path global loads one
+   // K-tile ahead, so their memory latency overlaps the current tile's dequant
+   // + LDS + WMMA instead of being exposed at the top of every iteration.
++  static_assert(!(PF == 1 && MT > 1), "PF only defined for MT==1");
+   const int pf_actual_n = n_tile + lane_lo;
+   const int pf_qz_shift = (pf_actual_n & 7) * 4;
+   uint32_t pf_qa = 0, pf_zq = 0;
+@@ -482,8 +487,8 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+     pf_sc = b_scales[g0 * size_n + pf_actual_n];
+   }
+ 
+-  __shared__ T b_lds[NT / 16][16][16];
+-  T(&b_tile)[16][16] = b_lds[(NT == 16) ? 0 : wave];  // DSH: per-wave slice
++  __shared__ T b_lds[MT][16][16];
++  T(&b_tile)[16][16] = b_lds[wave];  // DSH: 每 wave 一個 slice（MT=1 時等同行 0）
+   V16 b_frag;  // DSH: hoisted for the SFL path
+ 
+   for (int k_tile = k_start; k_tile < k_end; k_tile += 16) {
+@@ -796,7 +801,7 @@ __global__ void gemm_q4_wmma_kernel_16x16_1w(
+ 
+ #else  // non-RDNA3 device pass: empty kernel for symbol parity.
+ template <typename T, bool SFL = false, int NT = 16, int ABL = 0, int NACC = 1,
+-          int PF = 0>
++          int PF = 0, int MT = 1>
+ __global__ void gemm_q4_wmma_kernel_16x16_1w(const T*, const uint32_t*,
+                                              const uint32_t*, const T*, T*,
+                                              const int, const int, const int,
+@@ -825,6 +830,30 @@ void launch_gemm_q4_wmma_16x16_1w(const T* a, const uint32_t* b_q_weight,
+       zero_offset, b_q_perm, partials);
+ }
+ 
++// P31: MT=4 -> 128-thread block, 4 個獨立 16x16 tile（每 wave 一個）。
++// 目的：把「每 CU 最多 16 個 block」的排程鉗子放寬 4 倍。
++template <typename T>
++void launch_gemm_q4_wmma_16x16_4t(const T* a, const uint32_t* b_q_weight,
++                                  const uint32_t* b_qzeros, const T* b_scales,
++                                  const int* b_q_perm, T* c, int size_m,
++                                  int size_n, int size_k, int groups,
++                                  int zero_offset, cudaStream_t stream,
++                                  float* partials = nullptr,
++                                  int k_split_forced = 0) {
++  const int k_split =
++      (k_split_forced ? k_split_forced : compute_wmma_k_split_mn(size_m, size_n, size_k, 16, 64));
++  dim3 block(128);
++  dim3 grid((size_n + 63) / 64, (size_m + 15) / 16, k_split);
++  gemm_q4_wmma_kernel_16x16_1w<T, false, 16, 0, 1, 0, 4>
++      <<<grid, block, 0, stream>>>(a, b_q_weight, b_qzeros, b_scales, c,
++                                   size_m, size_n, size_k, groups, zero_offset,
++                                   b_q_perm, partials);
++}
++
++
++
++
++
+ // ---------------------------------------------------------------------------
+ // 量測專用 launcher：SFL / 16x32_2w / ABL。全部納入 SGL_WMMA_MEASUREMENT_BENCH。
+ // 2026-09-13 review 更正：先前只守衛了檔尾的 SGL_WMMA_VARIANT 分派表，這三個
+@@ -832,6 +861,265 @@ void launch_gemm_q4_wmma_16x16_1w(const T* a, const uint32_t* b_q_weight,
+ // 數值（見 kernel 內 ABL==2 的 z_f * 0.0f）。全部呼叫點都在檔尾受守衛的分派
+ // 區塊內，故一併守衛不會斷編譯。
+ // ---------------------------------------------------------------------------
++
++// ---------------------------------------------------------------------------
++// P51 (2026-09-13): 4-warp 64x64 結構 —— SGL_WMMA_VARIANT=2300
++// 社區參考：hipfire commit be57d8d (gemm_q8_0_wmma_4w.hip)
++//   "per-block weight reuse from 16x (single-warp 16x16) to 64x (4-warp 64x64)"
++//
++// Block = 128 threads = 4 warps。輸出 tile 64(M) x 16(N)：
++//   所有 4 個 warp 共用同一份 B（16x16 反量化 tile 放 LDS），
++//   各自負責 16 條 M row。B 的全域載入量與現行相同，但服務 4 倍輸出。
++// ---------------------------------------------------------------------------
++template <typename T, int NB = 4>
++__global__ void gemm_q4_wmma_4w_kernel(
++    const T* __restrict__ a, const uint32_t* __restrict__ b_q,
++    const uint32_t* __restrict__ b_qzeros, const T* __restrict__ b_scales,
++    T* __restrict__ c, const int size_m, const int size_n, const int size_k,
++    const int groups, const int zero_offset) {
++  using E = typename WmmaNative<T>::elem;
++  using V16 = typename WmmaNative<T>::v16;
++
++  const int warp = threadIdx.x >> 5;      // 0..NB-1
++  const int lane = threadIdx.x & 31;
++  const int lane_lo = lane & 15;
++  const int lane_hi = lane >> 4;
++
++  const int m_tile = blockIdx.y * (16 * NB) + warp * 16;
++  const int n_tile = blockIdx.x * 16;
++  if (m_tile >= size_m || n_tile >= size_n) return;
++
++  // B tile 放 LDS，4 個 warp 共用
++  __shared__ T b_lds[16][16];
++
++  const int groupsize = size_k / groups;
++  const int my_n = lane_lo;
++  const int my_k_octet = lane_hi;
++
++  v8fp32 c_acc = {0, 0, 0, 0, 0, 0, 0, 0};
++
++  for (int k_tile = 0; k_tile < size_k; k_tile += 16) {
++    // ---- wave 0 負責 dequant B 進 LDS（4 warps 共用）----
++    if (warp == 0) {
++      const int actual_n = n_tile + my_n;
++      if (actual_n < size_n) {
++        const int qk_row = (k_tile / 8) + my_k_octet;
++        const uint32_t qa = b_q[qk_row * size_n + actual_n];
++        const int g = k_tile / groupsize;
++        const int qz_idx = g * (size_n / 8) + actual_n / 8;
++        const int qz_shift = (actual_n & 7) * 4;
++        const uint32_t zero_v =
++            ((b_qzeros[qz_idx] >> qz_shift) & 0xF) + (uint32_t)zero_offset;
++        const T scale_t = b_scales[g * size_n + actual_n];
++        const int k_base = my_k_octet * 8;
++        if constexpr (std::is_same<T, half>::value) {
++          half2 z_prep, y_prep;
++          prep_zero_scale_fp16_precise(zero_v, scale_t, z_prep, y_prep);
++          half2 dq[4];
++          dequant_4bit_8_fp16_precise(qa, dq, z_prep, y_prep);
++          b_lds[k_base + 0][my_n] = __low2half(dq[0]);
++          b_lds[k_base + 1][my_n] = __high2half(dq[0]);
++          b_lds[k_base + 2][my_n] = __low2half(dq[1]);
++          b_lds[k_base + 3][my_n] = __high2half(dq[1]);
++          b_lds[k_base + 4][my_n] = __low2half(dq[2]);
++          b_lds[k_base + 5][my_n] = __high2half(dq[2]);
++          b_lds[k_base + 6][my_n] = __low2half(dq[3]);
++          b_lds[k_base + 7][my_n] = __high2half(dq[3]);
++        } else {
++          float z_f, y_f;
++          prep_zero_scale_bf16_f32(zero_v, scale_t, z_f, y_f);
++          bf162_t dq[4];
++          dequant_4bit_8_bf16_to_bf16(qa, dq, z_f, y_f);
++          b_lds[k_base + 0][my_n] = dq[0].x;
++          b_lds[k_base + 1][my_n] = dq[0].y;
++          b_lds[k_base + 2][my_n] = dq[1].x;
++          b_lds[k_base + 3][my_n] = dq[1].y;
++          b_lds[k_base + 4][my_n] = dq[2].x;
++          b_lds[k_base + 5][my_n] = dq[2].y;
++          b_lds[k_base + 6][my_n] = dq[3].x;
++          b_lds[k_base + 7][my_n] = dq[3].y;
++        }
++      }
++    }
++    __syncthreads();
++
++    // ---- 4 個 warp 各自讀同一份 B tile、用自己的 A rows ----
++    V16 b_frag;
++#pragma unroll
++    for (int i = 0; i < 16; ++i) b_frag[i] = bitcast_elem<T, E>(b_lds[i][lane_lo]);
++
++    V16 a_frag;
++    if (m_tile + (lane & 15) < size_m) {
++      __builtin_memcpy(&a_frag, a + (long)(m_tile + lane_lo) * size_k + k_tile,
++                       sizeof(a_frag));
++    } else {
++#pragma unroll
++      for (int i = 0; i < 16; ++i) a_frag[i] = (E)0;
++    }
++    c_acc = wmma_mma(a_frag, b_frag, c_acc);
++    __syncthreads();
++  }
++
++  // ---- epilogue ----
++  const int out_n = n_tile + lane_lo;
++  if (out_n < size_n) {
++#pragma unroll
++    for (int i = 0; i < 8; i++) {
++      const int out_m = m_tile + 2 * i + lane_hi;
++      if (out_m < size_m) {
++        if constexpr (std::is_same<T, half>::value) {
++          c[out_m * size_n + out_n] = __float2half_rn(c_acc[i]);
++        } else {
++          c[out_m * size_n + out_n] = __float2bfloat16(c_acc[i]);
++        }
++      }
++    }
++  }
++}
++
++
++// ---------------------------------------------------------------------------
++// P60 (2026-09-13): iu4 + 64x64_4w + 無 LDS  —— SGL_WMMA_VARIANT=2400
++//
++// 組合動機：
++//   官方 iu4 mapping 顯示 B[k][j] 落喺 lane j 的 GPR floor(k/8)，
++//   而 GPTQ 的 b_q[row][n] 每個 int32 正好是 8 個連續 K 的 nibble
++//   ⇒ b_q[k/8][n] 本身就是 iu4 的 B fragment。
++//   ⇒ 同時消除：16 次 LDS 讀/寫、bf16 反量化、跨 lane 移動。
++//
++// 代價：iu4 是整數累加器，scale（per (group,n)）必須每 group 事後乘入。
++// ---------------------------------------------------------------------------
++#ifdef SGL_WMMA_MEASUREMENT_BENCH  // P60: 量測專用 kernel
++template <typename T, bool NO_LOAD = false, bool NO_MMA = false, bool NO_VALU = false>
++__global__ void gemm_q4_wmma_iu4_nolds_kernel(
++    const T* __restrict__ a, const uint32_t* __restrict__ b_q,
++    const T* __restrict__ b_scales, T* __restrict__ c, const int size_m,
++    const int size_n, const int size_k, const int groups) {
++  using v2i = int32_t __attribute__((ext_vector_type(2)));
++  using v8i = int32_t __attribute__((ext_vector_type(8)));
++
++  const int wave_id = threadIdx.x >> 5;   // 0..3
++  const int lane = threadIdx.x & 31;
++  const int lane_lo = lane & 15;
++  const int lane_hi = lane >> 4;
++
++  const int n_tile = blockIdx.x * 64;
++  const int m_tile = blockIdx.y * 16;
++  if (m_tile >= size_m || n_tile >= size_n) return;
++
++  // wave w 負責 n ∈ [n_tile + 16w, +16)
++  const int n_wave = n_tile + wave_id * 16;
++  const int n = n_wave + lane_lo;           // 本 lane 負責的輸出欄
++  if (n >= size_n) return;
++
++  const int groupsize = size_k / groups;
++
++  // ---- A fragment：lane_lo = i (0..15)，lane_hi 提供 k/8 的另一半 ----
++  // A[i][k] 在 lane i 的 GPR floor(k/8)、nibble k%8。
++  // 每個 lane 需持有 A[lane_lo][0..15] 的 16 個 nibble = 2 個 int32。
++  // 本量測路徑以常數填值（A 的量化來源不在本變體範圍）。
++  v2i a_frag;
++  a_frag[0] = 0x11111111;
++  a_frag[1] = 0x11111111;
++
++  // fp32 累加（每 lane 8 個輸出格：D[i][j] 的 i 由 lane_hi 決定奇偶）
++  float acc[8];
++#pragma unroll
++  for (int i = 0; i < 8; ++i) acc[i] = 0.f;
++
++  const int kt_count = size_k / 16;      // 每 block 的 K-tile 數
++  const int kt_per_grp = groupsize / 16; // 每 group 的 K-tile 數（gs=128 -> 8）
++
++  // 整數累加器：一個 group 內的所有 K-tile 在同一個 c_int 上累加
++  v8i c_int = {0, 0, 0, 0, 0, 0, 0, 0};
++
++  for (int kt = 0; kt < kt_count; ++kt) {
++    // ---- B fragment：直接由 b_q 兩個 row 載入，零 LDS ----
++    const int row_base = kt * 2;   // (kt*16)/8
++    v2i b_frag;
++    if constexpr (NO_LOAD) {
++      b_frag[0] = (int32_t)(row_base + 0);
++      b_frag[1] = (int32_t)(row_base + 1);
++    } else {
++      b_frag[0] = (int32_t)b_q[(size_t)(row_base + 0) * size_n + n];
++      b_frag[1] = (int32_t)b_q[(size_t)(row_base + 1) * size_n + n];
++    }
++
++    if constexpr (NO_MMA) {
++      // 保留一個便宜的消費，避免整段被優化掉
++      c_int[0] += b_frag[0] & 1;
++      c_int[1] += b_frag[1] & 1;
++    } else {
++      c_int = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, a_frag, false,
++                                                         b_frag, c_int, false);
++    }
++
++    // group 邊界：整數結果 × scale 折入 fp32，並重設整數累加器
++    if constexpr (NO_VALU) {
++      /* D 實驗：完全唔做 WMMA→VALU 轉換，c_int 跨全部 K-tile 累加（純整數），
++         只在迴圈結束後折入 fp32 一次。 */
++    } else if ((kt % kt_per_grp) == (kt_per_grp - 1)) {
++      const int g = kt / kt_per_grp;
++      const float s = (float)b_scales[(size_t)g * size_n + n];
++#pragma unroll
++      for (int i = 0; i < 8; ++i) acc[i] += (float)c_int[i] * s;
++      c_int = (v8i){0, 0, 0, 0, 0, 0, 0, 0};
++    }
++  }
++  if constexpr (NO_VALU) {
++    const float s = (float)b_scales[(size_t)0 * size_n + n];
++#pragma unroll
++    for (int i = 0; i < 8; ++i) acc[i] = (float)c_int[i] * s;
++  }
++  // 尾數（size_k 不是 groupsize 整數倍時，理論上不會發生）
++  if ((kt_count % kt_per_grp) != 0) {
++    const int g = groups - 1;
++    const float s = (float)b_scales[(size_t)g * size_n + n];
++#pragma unroll
++    for (int i = 0; i < 8; ++i) acc[i] += (float)c_int[i] * s;
++  }
++
++  // ---- 輸出 ----
++  // D[i][j] 落喺 lane ((16*i)%32)+j → 本 wave 的 lane_lo = n 偏移、lane_hi 決定 i 的奇偶
++  const int m_out = m_tile + 2 * 0 + lane_hi;   // 佔位，實際見下
++#pragma unroll
++  for (int i = 0; i < 8; ++i) {
++    const int m = m_tile + 2 * i + lane_hi;
++    if (m < size_m) {
++      c[(size_t)m * size_n + n] = (T)acc[i];
++    }
++  }
++  (void)m_out;
++}
++#endif  // SGL_WMMA_MEASUREMENT_BENCH (P60 kernel)
++
++#ifdef SGL_WMMA_MEASUREMENT_BENCH
++template <typename T>
++void launch_gemm_q4_wmma_iu4_nolds(const T* a, const uint32_t* b_q_weight,
++                                   const T* b_scales, T* c, int size_m,
++                                   int size_n, int size_k, int groups,
++                                   cudaStream_t stream) {
++  dim3 block(128);
++  dim3 grid((size_n + 63) / 64, (size_m + 15) / 16, 1);
++  gemm_q4_wmma_iu4_nolds_kernel<T><<<grid, block, 0, stream>>>(
++      a, b_q_weight, b_scales, c, size_m, size_n, size_k, groups);
++}
++#endif
++
++#ifdef SGL_WMMA_MEASUREMENT_BENCH
++template <typename T>
++void launch_gemm_q4_wmma_4w(const T* a, const uint32_t* b_q_weight,
++                            const uint32_t* b_qzeros, const T* b_scales, T* c,
++                            int size_m, int size_n, int size_k, int groups,
++                            int zero_offset, cudaStream_t stream) {
++  dim3 block(128);
++  dim3 grid((size_n + 15) / 16, (size_m + 63) / 64, 1);
++  gemm_q4_wmma_4w_kernel<T><<<grid, block, 0, stream>>>(
++      a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
++      zero_offset);
++}
++#endif
++
+ #ifdef SGL_WMMA_MEASUREMENT_BENCH
+ 
+ // DSH 2026-09-13: SFL variant - B fragment built by shfl_xor(16) instead of a
+@@ -2520,6 +2808,49 @@ void launch_gemm_q4_wmma_64x64_4w(const T* a, const uint32_t* b_q_weight,
+         groups, zero_offset, stream, partials, k_split_forced);
+     return;
+   }
++  // P31: MT=4 —— 128-thread block，一個 block 出 4 個獨立 16x16 tile。
++  if (sgl_wmma_variant == 2100) {
++    launch_gemm_q4_wmma_16x16_4t<T>(
++        a, b_q_weight, b_qzeros, b_scales, b_q_perm, c, size_m, size_n, size_k,
++        groups, zero_offset, stream, partials, k_split_forced);
++    return;
++  }
++  if (sgl_wmma_variant == 2300) {
++    launch_gemm_q4_wmma_4w<T>(a, b_q_weight, b_qzeros, b_scales, c, size_m,
++                              size_n, size_k, groups, zero_offset, stream);
++    return;
++  }
++  if (sgl_wmma_variant == 2403) {
++    /* D: 移除 WMMA→VALU 轉換（c_int 全程整數累加），驗證 ISA Hazard 13.1。
++       數值無意義，只量 timing。 */
++    dim3 block(128);
++    dim3 grid((size_n + 63) / 64, (size_m + 15) / 16, 1);
++    gemm_q4_wmma_iu4_nolds_kernel<T, false, false, /*NO_VALU=*/true><<<grid, block, 0, stream>>>(
++        a, b_q_weight, b_scales, c, size_m, size_n, size_k, groups);
++    return;
++  }
++  if (sgl_wmma_variant == 2402) {
++    /* P60c: 移除 WMMA，只留迴圈骨架 + b_q 全域載入。量測「指令發射/迴圈控制」下限。 */
++    dim3 block(128);
++    dim3 grid((size_n + 63) / 64, (size_m + 15) / 16, 1);
++    gemm_q4_wmma_iu4_nolds_kernel<T, false, /*NO_MMA=*/true><<<grid, block, 0, stream>>>(
++        a, b_q_weight, b_scales, c, size_m, size_n, size_k, groups);
++    return;
++  }
++  if (sgl_wmma_variant == 2401) {
++    /* P60b: 完全移除 b_q 全域載入 —— 只量 timing，數值無意義。
++       目的：判定「全域載入」是否為 498-cycle 鏈的剩餘部分。 */
++    dim3 block(128);
++    dim3 grid((size_n + 63) / 64, (size_m + 15) / 16, 1);
++    gemm_q4_wmma_iu4_nolds_kernel<T, /*NO_LOAD=*/true><<<grid, block, 0, stream>>>(
++        a, b_q_weight, b_scales, c, size_m, size_n, size_k, groups);
++    return;
++  }
++  if (sgl_wmma_variant == 2400) {
++    launch_gemm_q4_wmma_iu4_nolds<T>(a, b_q_weight, b_scales, c, size_m,
++                                     size_n, size_k, groups, stream);
++    return;
++  }
+   // --- end DSH V1 ---
+ #endif  // SGL_WMMA_MEASUREMENT_BENCH
+   // Fall back to v4 when N < 64 (would waste 1+ waves on out-of-range cols).
+-- 
+2.43.0
+

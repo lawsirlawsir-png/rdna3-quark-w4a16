@@ -97,11 +97,47 @@ Quark 在 `pack_method="reorder"` 之下，每個 int32 內的 8 個 4-bit 值**
 
 ---
 
+## 技術層：kernel 補丁與 shim
+
+以上是**轉換層**。以下兩項是我們在 SGLang fork 上所做的**服務路徑**改動。
+
+### 1. 生產補丁系列 `patches/`
+
+19 個 patch，基底為 [@StevenChenSE/sglang](https://github.com/StevenChenSE/sglang) 的 `gfx1100-support` 分支 @ `1442c18`。
+
+**把本系列套用到乾淨檢出後，所得工作樹與我們生產建置來源逐位元相同** —— 即本系列不是節錄，就是我們的生產源碼樹。
+
+| Patch | 作用 | 實測 |
+|---|---|---|
+| 0002 | 小 M WMMA 門檻由 M≥16 下移至 `M>=9 && N>=2048` | M=9 GEMM **246.7 → 185.9 µs（−24.6%）**，E2E +1.8~3.9% |
+| 0004 | GPTQ 分派補 M_COUNT 5/6/7 | M=5 **0.20515 → 0.13743 ms（1.49×）**，M=4/M=8 零成本 |
+| 0005 | B2：Σa 預算與 z 修正改為每 group 一次 | M=4 −9.3%／M=5 −8.7%／M=8 −14.2%；E2E **68.38 → 72.84 t/s** |
+| 0007 | opt-in N-aware k_split | M=16 verify GEMM **−7.9%**，fp64 逐位元相同 |
+| 0019 | kernel witness 閘門改為 opt-in | 消除每次 KV 寫入的 GPU→CPU 同步 |
+
+詳見 `patches/README.md`。
+
+### 2. 低位寬 lm_head shim `shim/`
+
+lm_head 每步被讀 4 次（verify 1 次 M=4 ＋ draft 3 次 M=1），bf16 合共約 13.9 ms/步、佔步時約 20%。改走 INT4 後每次只讀 0.661 GB：
+
+| 階段 | 引擎吞吐（5K 上下文、temp 0） |
+|---|---|
+| bf16 lm_head（原狀） | 57.12 t/s |
+| int8 lm_head | 60.43 t/s |
+| **int4 lm_head** | **68.38 t/s（+19.7%）** |
+
+輸出 MD5 三者完全相同、accept length 4.0 不變。詳見 `shim/README.md`。
+
+---
+
 ## 倉庫內容
 
 | 路徑 | 內容 |
 |---|---|
-| `tools/convert_quark_int4_to_gptq_v3.py` | 轉換器本體（本倉唯一可執行檔） |
+| `tools/convert_quark_int4_to_gptq_v3.py` | 轉換器本體 |
+| `patches/` | 生產補丁系列（19 個 patch ＋ 說明） |
+| `shim/` | 低位寬 lm_head shim ＋ RDNA3 compat 補丁 |
 | `docs/SCOREBOARD-20260915.md` | 全部實測分數的單一記錄點 |
 | `docs/NONDETERMINISM-GREEDY-20260915.md` | greedy 非確定性的定量報告 |
 | `docs/COMMUNITY-POST-20260915.md` | 對應的論壇帖文（含完整致謝、失敗記錄與技術附錄） |
@@ -110,7 +146,7 @@ Quark 在 `pack_method="reorder"` 之下，每個 int32 內的 8 個 4-bit 值**
 
 ## 發佈政策
 
-- 本倉只放**原始碼**與**可獨立驗證的報告**。
+- 本倉只放**原始碼、補丁**與**可獨立驗證的報告**。
 - **生成物不入版控**：由 Markdown 衍生的 PDF／TXT 等一律不提交，需要時自行以任一 Markdown 渲染器產生。
 - 每一項數字都附量測條件與樣本數；任何無法復現的數字不列入。
 
@@ -119,14 +155,16 @@ Quark 在 `pack_method="reorder"` 之下，每個 int32 內的 8 個 4-bit 值**
 ## 已知限制
 
 - **只處理單一 `model.safetensors`** 的模型目錄（本轉換器針對 AMD 原版模型的佈局）。
-- **不含 kernel 改動。** 本倉所述「我們的做法」限於轉換層；我們的 SGLang fork 另有 kernel 層改動（相對上游 18 commit／42 檔），尚未在此發佈。帖文第六節已如實交代。
-- 需要約 19 GB 磁碟空間做中轉。
+- **kernel 層補丁未經第三方獨立驗證。** 我們的回歸護欄（`kernel_regression.py`：C1 數值 36 組 ＋ C2 端到端 ＋ C3 效能）已通過，但只在本機、本卡、本配置上跑過。
+- **shim 的 `M <= 8` 閘門**會令同一 prompt 的 logits 隨並發批次組成而異，屬可重現性風險（見 `shim/README.md`）。
+- 需要約 19 GB 磁碟空間做轉換中轉。
 
 ---
 
 ## 授權與出處
 
-- 本轉換器為我們自行撰寫，以 **Apache-2.0** 釋出。
+- 轉換器、補丁系列中我們撰寫的部分、以及 `shim/rdna_lmhead_int8.py` 均為我們自行撰寫，以 **Apache-2.0** 釋出。
 - 它依賴的 Quark 打包語義來自 [AMD Quark](https://github.com/amd/Quark)（Apache-2.0）。
-- 目標格式對齊 [vLLM](https://github.com/vllm-project/vllm) 的 GPTQ kernel 語義（Apache-2.0）。
+- 目標格式對齊 [vLLM](https://github.com/vllm-project/vllm) 的 GPTQ kernel 語義（Apache-2.0）；被修改的 kernel 源碼保留原版權聲明。
+- `shim/sitecustomize.py` 改寫自 [AMD-AIM/sglang-radeon](https://github.com/AMD-AIM/sglang-radeon)（Apache-2.0），已標明出處。
 - 模型本身來自 AMD（`amd/Qwen3.8-27B-Quark-AWQ-INT4-W4A16`）。
