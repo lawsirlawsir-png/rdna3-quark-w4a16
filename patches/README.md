@@ -1,7 +1,7 @@
 # 生產補丁系列（gfx1100 / RDNA3）
 
 **基底**：[@StevenChenSE/sglang](https://github.com/StevenChenSE/sglang) 分支 `gfx1100-support` 的 `1442c18`（2026-09-07）
-**Patch 數**：19（+4,091 / −14,870 行，42 個檔案）
+**Patch 數**：19（43 個檔案、+4,097 / −14,870 行）
 
 ## 套用
 

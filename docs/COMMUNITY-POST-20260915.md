@@ -274,7 +274,7 @@ AMD 在 HuggingFace 放出 `amd/Qwen3.8-27B-Quark-AWQ-INT4-W4A16`，但它在 RD
 | 1 | **量測上游 vLLM 的新路線** | 上游已改為 **M≤5 使用專用 INT4 skinny GEMM（`wvSplitK_int4_g`，wave 層分工 ＋ DPP 歸約、無原子競爭）、M>5 使用 Triton**。我們的 decode 有 80% 屬 M=4，恰好落在第一段。**A/B 工具已編譯完成，僅待執行** |
 | 2 | **檢驗非確定性的機制** | 同一個 A/B 實驗同時可驗：CAS 原子 對 DPP 歸約 |
 | 3 | **開啟 `--enable-deterministic-inference`** | 我們生產環境中此開關一直為 0。其說明為「batch invariant ops」，恰對應我們「精度隨 batch 跳變」的假設 |
-| 4 | **將 kernel 層一併開源** | 目前僅發佈轉換器層；kernel 改動（相對上游 18 commit／42 檔）仍在本機，尚未發佈 |
+| 4 | ~~將 kernel 層開源~~ | ✅ **已於 2026-09-15 完成** —— 以 patch series 形態發佈 **19 個 patch**（43 檔、+4,097 / −14,870 行），基底 `StevenChenSE/sglang` 之 `gfx1100-support` @ `1442c18`。**由 GitHub 下載後套用到乾淨檢出，可逐位元重現我們的生產樹。** https://github.com/lawsirlawsir-png/rdna3-quark-w4a16 |
 | 5 | **繼續追查那個 +10.25% / −7.81 pt 的差距** | 六個嫌疑已排除，機制尚未定位 |
 
 ---
@@ -381,7 +381,19 @@ AMD 在 HuggingFace 放出 `amd/Qwen3.8-27B-Quark-AWQ-INT4-W4A16`，但它在 RD
 
 **我們的 decode 有 80% 屬 M=4，恰好落在第一段；而我們目前兩段皆使用 GPTQ kernel。**
 
-### 8.7 硬體身份（實測）
+### 8.7 已發佈的技術層（供取用）
+
+    轉換器 : tools/convert_quark_int4_to_gptq_v3.py（Quark W4A16 → GPTQ，無損）
+    補丁   : patches/0001..0019.patch（基底 StevenChenSE/sglang gfx1100-support @ 1442c18）
+     shim   : shim/rdna_lmhead_int8.py（INT4 LM head，端到端 +19.7%）
+     repo   : https://github.com/lawsirlawsir-png/rdna3-quark-w4a16  (tag v1.0.0)
+
+    驗證方式：以 HTTPS 下載全部 19 個 patch → 套用到 1442c18 的乾淨檢出 →
+              git am 全數通過 → 與生產建置來源 git diff --quiet 無輸出（9,034 檔相同）。
+
+---
+
+### 8.8 硬體身份（實測）
 
     MARKET_NAME   : AMD Radeon PRO W7800 48GB
     SUBVENDOR_ID  : 0x1458  (GIGABYTE)
